@@ -1,3 +1,5 @@
+By https://t.me/cpb_msk OSINT communtiy
+
 # igdump
 
 Exports an Instagram account's posts into a self-contained HTML feed with all media saved locally.
