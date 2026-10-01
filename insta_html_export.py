@@ -11,7 +11,6 @@ import re
 import time
 import sys
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from html import escape
 from importlib.metadata import version as _pkg_version, PackageNotFoundError
@@ -25,15 +24,19 @@ _DEBUG_EVENTS: list[dict[str, Any]] = []
 _DEBUG_LOG_PATH: Path | None = None
 
 def _debug_event(event_type: str, message: str, **context) -> None:
+    def redact(value):
+        if isinstance(value, str):
+            return re.sub(r"(sessionid|csrftoken)=([^&\s]+)", r"\1=***", value, flags=re.IGNORECASE)
+        return value
     entry: dict[str, Any] = {
         "t": datetime.now(UTC).isoformat(),
         "event": event_type,
-        "msg": message,
+        "msg": redact(message),
     }
     if context:
-        entry["ctx"] = {k: v for k, v in context.items() if v is not None}
+        entry["ctx"] = {k: redact(v) for k, v in context.items() if v is not None}
     _DEBUG_EVENTS.append(entry)
-    logger.debug("[dbg] %s: %s", event_type, message)
+    logger.debug("[dbg] %s: %s", event_type, entry["msg"])
 
 
 def _save_debug_log(output_dir: Path) -> None:
@@ -79,6 +82,7 @@ def _patch_session_for_logging(session: requests.Session) -> None:
     session.send = logged_send  # type: ignore[method-assign]
 
 import requests
+from igdump_storage import read_json, write_json, load_comment_cache, save_comment_cache
 from playwright.sync_api import BrowserContext, Error as PlaywrightError, Page, Playwright, TimeoutError, sync_playwright
 
 logger = logging.getLogger("igdump")
@@ -105,13 +109,13 @@ DEFAULT_PROFILE_DIR = Path.home() / ".insta-export" / "chrome-profile"
 POST_WAIT_MS = 2500
 NAVIGATION_TIMEOUT_MS = 30_000
 AUTH_PROFILE_DOC_ID = "7898261790222653"
-TEMPLATE_DIR = Path(__file__).parent / "templates"
+TEMPLATE_DIR = Path(__file__).parent / "igdump_assets"
 HTML_TEMPLATE = (TEMPLATE_DIR / "index.html").read_text(encoding="utf-8")
 
 try:
     VERSION = _pkg_version("igdump")
 except PackageNotFoundError:
-    VERSION = "0.2.0"
+    VERSION = "0.3.0"
 
 
 class ExportError(RuntimeError):
@@ -297,6 +301,8 @@ all и oldest — отдельные команды, их нельзя писа�
 
     common_parent = argparse.ArgumentParser(add_help=False)
     common_parent.add_argument("username", type=instagram_username, metavar="USERNAME", help="Имя профиля с @ или без: @kharlamova_alena или natgeo.")
+    common_parent.add_argument("--refresh", action="store_true", help="Заново собрать ссылки и обновить посты/комментарии вместо пропуска обработанных.")
+    common_parent.add_argument("--download-videos", action="store_true", help="Скачивать видео для all/oldest. По умолчанию сохраняются только изображения и обложки видео.")
     common_parent.add_argument(
         "--dry-run",
         action="store_true",
@@ -381,7 +387,10 @@ all и oldest — отдельные команды, их нельзя писа�
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments[:2] == ["all", "oldest"]:
         parser.error("all и oldest — отдельные команды. Для первых 100 постов: python insta_html_export.py oldest @kharlamova_alena --limit 100")
-    return parser.parse_args(arguments)
+    parsed = parser.parse_args(arguments)
+    if parsed.mode == "comments" and parsed.download_videos:
+        parser.error("--download-videos используется только с all или oldest.")
+    return parsed
 
 
 def safe_slug(value: str) -> str:
@@ -397,7 +406,7 @@ def build_job_slug(args: argparse.Namespace) -> str:
 
 def format_count(value: int | None) -> str:
     if value is None:
-        return "0"
+        return "—"
     return f"{value:,}".replace(",", " ")
 
 
@@ -408,20 +417,6 @@ def ensure_output_dir(base: str | None, args: argparse.Namespace) -> Path:
         root = (Path.cwd() / "exports" / build_job_slug(args)).resolve()
     (root / "media").mkdir(parents=True, exist_ok=True)
     return root
-
-
-def read_json(path: Path) -> dict[str, Any] | None:
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-
-
-def write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def export_state_path(output_dir: Path) -> Path:
@@ -646,9 +641,9 @@ def _scrape_profile_html(username: str) -> tuple[dict[str, Any], list[str], str 
                 "username": user_obj.get("username") or username,
                 "full_name": user_obj.get("full_name") or username,
                 "biography": user_obj.get("biography") or "",
-                "mediacount": (user_obj.get("edge_owner_to_timeline_media") or {}).get("count") or 0,
-                "followers": 0,
-                "followees": 0,
+                "mediacount": (user_obj.get("edge_owner_to_timeline_media") or {}).get("count"),
+                "followers": (user_obj.get("edge_followed_by") or {}).get("count"),
+                "followees": (user_obj.get("edge_follow") or {}).get("count"),
                 "avatar_url": user_obj.get("profile_pic_url_hd") or user_obj.get("profile_pic_url") or "",
             }
             _debug_event("profile.init_state_ok", f"links={len(links)}, uid={uid!r}", links_count=len(links), uid=uid or None)
@@ -682,8 +677,8 @@ def _scrape_profile_html(username: str) -> tuple[dict[str, Any], list[str], str 
         "full_name": display_name,
         "biography": "",
         "mediacount": None,
-        "followers": 0,
-        "followees": 0,
+        "followers": None,
+        "followees": None,
         "avatar_url": "",
     }
     _debug_event("profile.regex_fallback", f"links={len(links)}, uid={uid!r}", links_count=len(links), uid=uid or None)
@@ -975,8 +970,8 @@ def collect_post_links(
     initial_cursor: str | None,
     user_id: str | None = None,
 ) -> list[str]:
-    cache = load_post_links(output_dir, username)
-    links = unique_keep_order([*cache["links"], *seed_links])
+    cache = load_post_links(output_dir, username) if not getattr(args, "refresh", False) else {"links": [], "completed": False, "cursor": None}
+    links = unique_keep_order([*seed_links, *cache["links"]])
     if cache["completed"] and len(links) >= total_available > 0:
         logger.info("Loaded %s cached post links from %s", len(links), post_links_path(output_dir))
         return links
@@ -992,7 +987,7 @@ def collect_post_links(
             logger.warning("Collected %s of %s links before cursor ran out", len(links), total_available)
             if args.mode == "oldest":
                 raise ExportError("Instagram вернул неполный список без следующей страницы. Первые посты не определены; повторите команду позже.")
-        save_post_links(output_dir, args, links, total_available, completed=True, cursor=None)
+        save_post_links(output_dir, args, links, total_available, completed=not (total_available and len(links) < total_available), cursor=None)
         return links
 
     if cache["links"]:
@@ -1028,7 +1023,8 @@ def collect_post_links(
 
     if total_available and len(links) < total_available:
         logger.warning("Collected %s of %s links before pagination stopped", len(links), total_available)
-    save_post_links(output_dir, args, links, total_available, completed=cursor is None, cursor=cursor)
+    exhausted = cursor is None and not (total_available and len(links) < total_available)
+    save_post_links(output_dir, args, links, total_available, completed=exhausted, cursor=cursor)
     if args.mode == "oldest" and (cursor is not None or (total_available and len(links) < total_available)):
         raise ExportError("Не удалось дойти до начала истории профиля. Ссылки сохранены; повторите ту же команду позже для продолжения.")
     return links
@@ -1074,7 +1070,7 @@ def extract_fallback_post(page: Page, url: str) -> dict[str, Any]:
         "code": shortcode,
         "media_type": 2 if video_url else 1,
         "caption": {"text": description},
-        "taken_at": int(datetime.now(UTC).timestamp()),
+        "taken_at": None,
         "image_versions2": {"candidates": [{"url": image_url}]} if image_url else {"candidates": []},
         "video_versions": [{"url": video_url}] if video_url else [],
         "user": {"username": urlparse(url).path.strip("/").split("/")[0]},
@@ -1130,42 +1126,48 @@ def scrape_post_payload(browser: InstagramBrowser, url: str) -> dict[str, Any]:
         page.close()
 
 
-def _extract_media_url(item: dict[str, Any]) -> str:
+def _extract_media_url(item: dict[str, Any], download_videos: bool = False) -> str:
     candidates = item.get("image_versions2", {}).get("candidates") or []
     versions = item.get("video_versions") or []
+    if download_videos and versions:
+        return versions[0].get("url", "")
     if candidates:
         return candidates[0]["url"]
-    if versions:
-        return versions[0].get("url", "")
     return ""
 
 
-def _download_single_media(session: requests.Session, media_dir: Path, base_name: str, slide: int, item: dict[str, Any]) -> Path:
-    url = _extract_media_url(item)
+def _download_single_media(session: requests.Session, media_dir: Path, base_name: str, slide: int, item: dict[str, Any], download_videos: bool = False) -> Path:
+    url = _extract_media_url(item, download_videos)
     if not url:
         raise ExportError(f"Could not find media URL for {base_name} slide {slide}")
     target = media_dir / f"{base_name}_{slide}" if slide > 0 else media_dir / base_name
     return download_binary(session, url, target)
 
 
-def build_post_record(session: requests.Session, payload: dict[str, Any], media_dir: Path, index: int, url: str) -> dict[str, Any]:
+def build_post_record(session: requests.Session, payload: dict[str, Any], media_dir: Path, index: int, url: str, download_videos: bool = False) -> dict[str, Any]:
     shortcode = payload.get("code") or parse_shortcode_from_url(url)
     media_type = payload.get("media_type", 1)
-    base_name = f"{index:04d}-{safe_slug(shortcode)}"
+    base_name = safe_slug(shortcode) + ("-video" if download_videos else "-cover")
 
     caption = ((payload.get("caption") or {}).get("text") or "").strip()
     taken_at = payload.get("taken_at")
+    date_value = None
     if isinstance(taken_at, int):
-        date_value = datetime.fromtimestamp(taken_at, tz=UTC).astimezone()
-    else:
+        try:
+            date_value = datetime.fromtimestamp(taken_at, tz=UTC).astimezone()
+        except (ValueError, OverflowError, OSError):
+            pass
+    if date_value is None:
         fallback_timestamp = payload.get("_fallback_timestamp")
         if fallback_timestamp:
             try:
                 date_value = datetime.fromisoformat(fallback_timestamp.replace("Z", "+00:00")).astimezone()
             except ValueError:
-                date_value = datetime.now().astimezone()
+                date_value = None
         else:
-            date_value = datetime.now().astimezone()
+            date_value = None
+
+    date_label = date_value.strftime("%d.%m.%Y %H:%M") if date_value else "Дата неизвестна"
 
     kind_label = {1: "Image", 2: "Video", 8: "Carousel"}.get(media_type, "Post")
     likes = payload.get("like_count")
@@ -1177,7 +1179,7 @@ def build_post_record(session: requests.Session, payload: dict[str, Any], media_
         media_paths: list[str] = []
         first_alt = ""
         for slide_idx, item in enumerate(items):
-            media_file = _download_single_media(session, media_dir, base_name, slide_idx, item)
+            media_file = _download_single_media(session, media_dir, base_name, slide_idx, item, download_videos)
             rel = f"media/{media_file.name}"
             media_paths.append(rel)
             if slide_idx == 0:
@@ -1188,17 +1190,19 @@ def build_post_record(session: requests.Session, payload: dict[str, Any], media_
             "caption": caption,
             "local_media_path": media_paths[0],
             "media_paths": media_paths,
+            "download_videos": download_videos,
+            "media_types": ["video" if download_videos and item.get("video_versions") else "image" for item in items],
             "instagram_url": normalized_post_url(url),
-            "date_label": date_value.strftime("%d.%m.%Y %H:%M"),
-            "likes_label": f"Likes: {format_count(likes if isinstance(likes, int) else 0)}",
-            "comments_label": f"Comments: {format_count(comments if isinstance(comments, int) else 0)}",
+            "date_label": date_label,
+            "likes_label": f"Likes: {format_count(likes if isinstance(likes, int) else None)}",
+            "comments_label": f"Comments: {format_count(comments if isinstance(comments, int) else None)}",
             "kind_label": kind_label,
             "alt_text": alt_text,
         }
 
     # Single image / video
     item = payload
-    url_from_item = _extract_media_url(item)
+    url_from_item = _extract_media_url(item, download_videos)
     if not url_from_item:
         raise ExportError(f"Could not find media URL for {url}")
 
@@ -1210,10 +1214,12 @@ def build_post_record(session: requests.Session, payload: dict[str, Any], media_
         "caption": caption,
         "local_media_path": f"media/{media_file.name}",
         "media_paths": [f"media/{media_file.name}"],
+        "download_videos": download_videos,
+        "media_types": ["video" if download_videos and item.get("video_versions") else "image"],
         "instagram_url": normalized_post_url(url),
-        "date_label": date_value.strftime("%d.%m.%Y %H:%M"),
-        "likes_label": f"Likes: {format_count(likes if isinstance(likes, int) else 0)}",
-        "comments_label": f"Comments: {format_count(comments if isinstance(comments, int) else 0)}",
+        "date_label": date_label,
+        "likes_label": f"Likes: {format_count(likes if isinstance(likes, int) else None)}",
+        "comments_label": f"Comments: {format_count(comments if isinstance(comments, int) else None)}",
         "kind_label": kind_label,
         "alt_text": alt_text,
     }
@@ -1286,7 +1292,7 @@ def run(args: argparse.Namespace) -> int:
         logger.info("Resolved @%s profile metadata", profile["username"])
 
         # Try to resume from saved cursor; if missing, fetch first page fresh.
-        cached = load_post_links(output_dir, profile["username"])
+        cached = load_post_links(output_dir, profile["username"]) if not args.refresh else {"links": [], "cursor": None}
         saved_cursor = cached.get("cursor")
         if cached["links"] and saved_cursor is not None:
             initial_links: list[str] = []
@@ -1309,6 +1315,10 @@ def run(args: argparse.Namespace) -> int:
             user_id=user_id,
         )
         logger.info("Collected %s post URLs", len(all_links))
+        timeline_state = read_json(post_links_path(output_dir))
+        timeline_complete = timeline_state is None or bool(timeline_state.get("completed"))
+        if not timeline_complete:
+            logger.warning("Список публикаций получен не полностью. Архив будет частичным; повторите команду позже.")
 
         selected_links = select_post_links(all_links, args)
         if args.dry_run:
@@ -1350,7 +1360,7 @@ def run(args: argparse.Namespace) -> int:
         for index, post_url in enumerate(selected_links, start=1):
             shortcode = parse_shortcode_from_url(post_url)
             existing_record = records_by_shortcode.get(shortcode)
-            if existing_record:
+            if existing_record and not args.refresh and existing_record.get("download_videos", False) == args.download_videos:
                 media_path = existing_record.get("local_media_path")
                 media_paths = existing_record.get("media_paths") or [media_path] if media_path else []
                 all_exist = all(
@@ -1363,55 +1373,39 @@ def run(args: argparse.Namespace) -> int:
                     continue
             need_scrape.append((index, post_url, shortcode))
 
-        # Scrape post payloads sequentially (requires browser context)
-        scraped: list[tuple[int, str, str, dict[str, Any]]] = []
+        def checkpoint(completed: bool = False) -> None:
+            by_code = {record["shortcode"]: record for record in post_records}
+            ordered = [by_code[code] for url in selected_links
+                       if (code := parse_shortcode_from_url(url)) in by_code]
+            save_export_state(output_dir, args, profile, avatar_name, ordered, completed=completed)
+            generate_html(profile=profile, post_records=ordered, avatar_src=avatar_name,
+                          mode_label=build_mode_label(args), output_dir=output_dir, batch_size=max(1, args.batch_size))
+
+        checkpoint()
+        errors: list[str] = []
         for index, post_url, shortcode in need_scrape:
-            logger.info("Scraping %s/%s %s", index, len(selected_links), shortcode)
-            payload = scrape_post_payload(browser, post_url)
-            scraped.append((index, post_url, shortcode, payload))
+            logger.info("Пост %s/%s: %s", index, len(selected_links), shortcode)
+            try:
+                payload = scrape_post_payload(browser, post_url)
+                record = build_post_record(session, payload, output_dir / "media", index, post_url,
+                                           download_videos=args.download_videos)
+            except (ExportError, requests.RequestException, PlaywrightError, OSError) as exc:
+                logger.error("Не удалось выгрузить %s: %s", shortcode, exc)
+                errors.append(shortcode)
+                continue
+            post_records.append(record)
+            checkpoint()
 
-        # Download media in parallel
-        if scraped:
-            logger.info("Downloading %s media items ...", len(scraped))
-            errors: list[str] = []
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                fut_map: dict[Any, tuple[int, str]] = {}
-                for index, post_url, shortcode, payload in scraped:
-                    fut = pool.submit(build_post_record, session, payload, output_dir / "media", index, post_url)
-                    fut_map[fut] = (index, shortcode)
+        completed = len(post_records) == len(selected_links) and not errors and timeline_complete
+        checkpoint(completed)
+        logger.info("Сохранено %s из %s постов; ошибок: %s. Архив: %s",
+                    len(post_records), len(selected_links), len(errors), output_dir / "index.html")
+        if errors:
+            logger.warning("Повторите ту же команду для загрузки пропущенных постов: %s", ", ".join(errors))
+        _save_debug_log(output_dir)
+        print((output_dir / "index.html").as_uri())
+        return 0 if completed else 4
 
-                results: dict[int, dict[str, Any]] = {}
-                for fut in as_completed(fut_map):
-                    idx, shortcode = fut_map[fut]
-                    try:
-                        results[idx] = fut.result()
-                    except ExportError as exc:
-                        logger.error("Skipping %s: %s", shortcode, exc)
-                        errors.append(shortcode)
-
-            if results:
-                post_records.extend(results[i] for i in sorted(results))
-                save_export_state(output_dir, args, profile, avatar_name, post_records, completed=False)
-            if errors:
-                logger.warning("%s post(s) failed and were skipped: %s", len(errors), ", ".join(errors))
-
-        records_by_shortcode = {record["shortcode"]: record for record in post_records}
-        post_records = [
-            records_by_shortcode[code]
-            for url in selected_links
-            if (code := parse_shortcode_from_url(url)) in records_by_shortcode
-        ]
-        generate_html(
-            profile=profile,
-            post_records=post_records,
-            avatar_src=avatar_name,
-            mode_label=build_mode_label(args),
-            output_dir=output_dir,
-            batch_size=max(1, args.batch_size),
-        )
-        save_export_state(output_dir, args, profile, avatar_name, post_records, completed=len(post_records) == len(selected_links))
-        print(f"file://{output_dir / 'index.html'}")
-        return 0
 
 
 def main() -> int:
@@ -1544,12 +1538,23 @@ def fetch_all_comments(
     media_id = shortcode_to_media_id(shortcode)
     all_comments: list[dict[str, Any]] = []
     max_id: str | None = None
+    seen_cursors: set[str] = set()
+    seen_ids: set[str] = set()
 
     while True:
         comments, next_max_id, has_more = fetch_comments_page(session, media_id, max_id, delay)
-        all_comments.extend(comments)
-        if not has_more or not next_max_id:
+        for comment in comments:
+            key = str(comment.get("pk") or comment.get("id") or "")
+            if key and key in seen_ids:
+                continue
+            if key:
+                seen_ids.add(key)
+            all_comments.append(comment)
+        if not has_more:
             break
+        if not next_max_id or next_max_id in seen_cursors:
+            raise ExportError("Instagram не вернул новую страницу комментариев. Пост не помечен обработанным; повторите запуск позже.")
+        seen_cursors.add(next_max_id)
         max_id = next_max_id
 
     return all_comments
@@ -1713,17 +1718,12 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 
 
 def _load_config() -> dict[str, Any]:
-    if CONFIG_FILE.exists():
-        try:
-            return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            pass
-    return {}
+    return read_json(CONFIG_FILE) or {}
 
 
 def _save_config(config: dict[str, Any]) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json(CONFIG_FILE, config)
 
 
 def _session_from_sessionid(sessionid: str) -> requests.Session:
@@ -1757,33 +1757,17 @@ def _session_from_sessionid(sessionid: str) -> requests.Session:
 
 
 def _session_is_valid(session: requests.Session) -> bool:
-    """Check if the session is actually authenticated by hitting a protected endpoint."""
+    """Only a successful protected endpoint confirms authentication."""
+    response = session.get(f"{IG_BASE_URL}/api/v1/accounts/current_user/",
+                           timeout=15, allow_redirects=False)
     try:
-        resp = session.get(
-            "https://www.instagram.com/api/v1/accounts/current_user/",
-            timeout=15,
-            allow_redirects=False,
-        )
-        if resp.status_code in (302, 303, 307, 401):
-            _debug_event("session.invalid", f"Redirect/auth required, status={resp.status_code}")
+        if response.status_code in (301, 302, 303, 307, 308, 400, 401, 403):
             return False
-        if resp.status_code == 200:
-            return True
-        # Some other status — try a second lightweight check
-        resp2 = session.get(
-            f"{IG_BASE_URL}/api/v1/si/fetch_headers/",
-            params={"client_version": "1"},
-            timeout=10,
-            allow_redirects=False,
-        )
-        if resp2.status_code in (302, 303, 307):
-            _debug_event("session.invalid", "fetch_headers redirected")
-            return False
-        return True
-    except requests.RequestException as exc:
-        _debug_event("session.check_error", f"Session check failed: {exc}")
-        # If the check itself fails, assume session might still be valid
-        return True
+        response.raise_for_status()
+        payload = response.json()
+        return isinstance(payload, dict) and bool(payload.get("user"))
+    finally:
+        response.close()
 
 
 def _fetch_csrftoken(session: requests.Session) -> str | None:
@@ -1882,7 +1866,7 @@ def run_comments(args: argparse.Namespace) -> int:
     # Fetch profile metadata (non-fatal — comments can proceed without it)
     profile, initial_links, end_cursor, user_id = None, [], None, None
     try:
-        fetched_profile, fetched_links, fetched_cursor, fetched_uid = fetch_profile_info(public_api_session(), args.username)
+        fetched_profile, fetched_links, fetched_cursor, fetched_uid = fetch_profile_info(session, args.username)
         profile = fetched_profile
         initial_links = fetched_links
         end_cursor = fetched_cursor
@@ -1903,14 +1887,18 @@ def run_comments(args: argparse.Namespace) -> int:
 
     # Collect all post links
     username = profile["username"] if profile else args.username
-    cached = load_post_links(output_dir, username)
+    cached = load_post_links(output_dir, username) if not args.refresh else {"links": [], "cursor": None}
     saved_cursor = cached.get("cursor")
     if cached["links"] and saved_cursor is not None:
         initial_links = []
         end_cursor = None
-    elif not initial_links:
+    else:
         _debug_event("timeline.initial", "Fetching first page of posts")
-        initial_links, end_cursor, _ = fetch_authenticated_timeline_page(session, username, None, user_id=user_id or None)
+        initial_links, end_cursor, has_next = fetch_authenticated_timeline_page(session, username, None, user_id=user_id or None)
+        if has_next and end_cursor is None:
+            raise ExportError("Instagram не вернул указатель следующей страницы. Список постов для комментариев не завершён.")
+        if not has_next:
+            end_cursor = None
 
     mediacount = profile.get("mediacount") if profile else 0
     all_links = collect_post_links(
@@ -1933,62 +1921,34 @@ def run_comments(args: argparse.Namespace) -> int:
 
     delay = getattr(args, "comment_delay", 2.0)
 
-    # Load existing comment cache
     comments_file = output_dir / ".comments.json"
-    if comments_file.exists():
-        try:
-            existing = json.loads(comments_file.read_text(encoding="utf-8"))
-            existing_comments: list[dict] = existing.get("comments", [])
-            existing_shortcodes: set[str] = {c["post_shortcode"] for c in existing_comments if "post_shortcode" in c}
-        except (OSError, json.JSONDecodeError):
-            existing_comments = []
-            existing_shortcodes = set()
-    else:
-        existing_comments = []
-        existing_shortcodes = set()
-
-    if existing_shortcodes:
-        logger.info("Resuming with %s cached comments from %s posts", len(existing_comments), len(existing_shortcodes))
-
-    all_comment_records: list[dict[str, Any]] = list(existing_comments)
-    post_links_to_process = [
-        (i, url)
-        for i, url in enumerate(selected_links, start=1)
-        if parse_shortcode_from_url(url) not in existing_shortcodes
-    ]
-
-    if not post_links_to_process:
-        logger.info("All posts already have comments cached")
-    else:
-        logger.info("Fetching comments for %s posts (delay=%ss) ...", len(post_links_to_process), delay)
-
-    for index, post_url in post_links_to_process:
+    all_cached_records, completed_posts = load_comment_cache(comments_file, username)
+    selected_codes = {parse_shortcode_from_url(url) for url in selected_links}
+    timeline_state = read_json(post_links_path(output_dir))
+    errors: list[str] = [] if timeline_state is None or timeline_state.get("completed") else ["список публикаций не завершён"]
+    for index, post_url in enumerate(selected_links, start=1):
         shortcode = parse_shortcode_from_url(post_url)
-        logger.info("Comments %s/%s %s", index, len(selected_links), shortcode)
-
+        if shortcode in completed_posts and not args.refresh:
+            logger.info("Комментарии %s/%s: %s уже обработан", index, len(selected_links), shortcode)
+            continue
+        logger.info("Комментарии %s/%s: %s", index, len(selected_links), shortcode)
         try:
             raw_comments = fetch_all_comments(session, shortcode, delay)
-        except ExportError as exc:
-            logger.error("Skipping %s: %s", shortcode, exc)
+            records = [build_comment_record(c, shortcode) for c in raw_comments]
+        except (ExportError, requests.RequestException, ValueError) as exc:
+            logger.error("Не удалось собрать комментарии %s: %s", shortcode, exc)
+            errors.append(shortcode)
             continue
+        all_cached_records = [record for record in all_cached_records if record.get("post_shortcode") != shortcode]
+        all_cached_records.extend(records)
+        completed_posts.add(shortcode)
+        save_comment_cache(comments_file, username, all_cached_records, completed_posts)
+        logger.info("Сохранено %s комментариев", len(records))
 
-        records = [build_comment_record(c, shortcode) for c in raw_comments]
-        all_comment_records.extend(records)
-        logger.info("  → %s comments", len(records))
-
-        # Save incrementally
-        comments_file.write_text(
-            json.dumps({"comments": all_comment_records, "updated_at": datetime.now(UTC).isoformat()}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-
-    logger.info("Total comments collected: %s", len(all_comment_records))
-    _debug_event("comments.done", f"Total comments: {len(all_comment_records)}", count=len(all_comment_records))
-
-    if not all_comment_records:
-        logger.warning("No comments found for any post")
-        _save_debug_log(output_dir)
-        return 0
+    all_comment_records = [record for record in all_cached_records if record.get("post_shortcode") in selected_codes]
+    logger.info("Обработано %s из %s постов; комментариев: %s; ошибок: %s",
+                len(selected_codes & completed_posts), len(selected_codes), len(all_comment_records), len(errors))
+    _debug_event("comments.done", "Comments export finished", count=len(all_comment_records), errors=errors)
 
     stats = aggregate_comment_stats(all_comment_records, len(selected_links))
     raw_json = json.dumps({"stats": stats}, ensure_ascii=False).replace("</", "<\\/")
@@ -2008,10 +1968,11 @@ def run_comments(args: argparse.Namespace) -> int:
         _save_comments_csv(all_comment_records, output_dir)
     except Exception as exc:
         logger.warning("Could not save CSV: %s", exc)
+        errors.append("comments.csv")
 
-    print(f"file://{comments_html}")
+    print(comments_html.as_uri())
     _save_debug_log(output_dir)
-    return 0
+    return 4 if errors else 0
 
 
 def _save_comments_csv(records: list[dict[str, Any]], output_dir: Path) -> None:

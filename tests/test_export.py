@@ -52,6 +52,165 @@ class CommandTests(unittest.TestCase):
 
 
 class ExportTests(unittest.TestCase):
+    def test_atomic_state_write_keeps_previous_state_on_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            app.write_json(path, {"saved": 1})
+            with patch.object(Path, "replace", side_effect=OSError("interrupted")):
+                with self.assertRaises(OSError):
+                    app.write_json(path, {"saved": 2})
+            self.assertEqual(app.read_json(path), {"saved": 1})
+            self.assertFalse(path.with_name("state.json.tmp").exists())
+
+    def test_session_requires_authenticated_user(self):
+        response = MagicMock(status_code=200)
+        session = MagicMock()
+        session.get.return_value = response
+        response.json.return_value = {}
+        self.assertFalse(app._session_is_valid(session))
+        response.json.return_value = {"user": {"pk": "1"}}
+        self.assertTrue(app._session_is_valid(session))
+        response.raise_for_status.side_effect = requests.HTTPError("429")
+        with self.assertRaises(requests.HTTPError):
+            app._session_is_valid(session)
+
+    def test_empty_comment_export_produces_files_and_skips_next_fetch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = app.parse_args(["comments", "natgeo", "--sessionid", "test", "--output-dir", directory])
+            with (
+                patch.object(app, "_session_from_sessionid", return_value=MagicMock()),
+                patch.object(app, "_save_config"),
+                patch.object(app, "fetch_profile_info", return_value=({"username": "natgeo", "mediacount": 1}, [], None, "1")),
+                patch.object(app, "fetch_authenticated_timeline_page", return_value=(["https://www.instagram.com/p/A/"], None, False)),
+                patch.object(app, "fetch_all_comments", return_value=[]) as fetch,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(app.run_comments(args), 0)
+                self.assertEqual(app.run_comments(args), 0)
+                fetch.assert_called_once()
+            self.assertTrue((Path(directory) / "comments.html").exists())
+            self.assertTrue((Path(directory) / "comments.csv").exists())
+
+    def test_incomplete_all_timeline_returns_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = app.parse_args(["all", "natgeo", "--output-dir", directory])
+            with (
+                patch.object(app, "InstagramBrowser"),
+                patch.object(app, "preflight_instagram_access"),
+                patch.object(app, "fetch_profile_info", return_value=({"username": "natgeo", "mediacount": 100}, [], None, "1")),
+                patch.object(app, "fetch_authenticated_timeline_page", return_value=(["https://www.instagram.com/p/A/"], None, False)),
+                patch.object(app, "scrape_post_payload", return_value={}),
+                patch.object(app, "build_post_record", return_value={"shortcode": "A"}),
+                patch.object(app, "generate_html"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(app.run(args), 4)
+            self.assertFalse(app.load_export_state(Path(directory), args)["completed"])
+
+    def test_video_download_is_opt_in(self):
+        item = {"image_versions2": {"candidates": [{"url": "cover.jpg"}]},
+                "video_versions": [{"url": "movie.mp4"}]}
+        self.assertEqual(app._extract_media_url(item), "cover.jpg")
+        self.assertEqual(app._extract_media_url(item, True), "movie.mp4")
+        self.assertEqual(app._extract_media_url({"video_versions": [{"url": "movie.mp4"}]}), "")
+        self.assertFalse(app.parse_args(["all", "natgeo"]).download_videos)
+        self.assertTrue(app.parse_args(["all", "natgeo", "--download-videos"]).download_videos)
+
+    def test_real_date_and_unknown_date_are_preserved(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(app, "download_binary", return_value=Path(directory) / "cover.jpg"):
+            payload = {"code": "A", "taken_at": None, "_fallback_timestamp": "2020-01-02T12:00:00Z",
+                       "image_versions2": {"candidates": [{"url": "cover.jpg"}]}}
+            record = app.build_post_record(MagicMock(), payload, Path(directory), 1, "https://www.instagram.com/p/A/")
+            self.assertIn("02.01.2020", record["date_label"])
+            payload.pop("_fallback_timestamp")
+            record = app.build_post_record(MagicMock(), payload, Path(directory), 1, "https://www.instagram.com/p/A/")
+            self.assertEqual(record["date_label"], "Дата неизвестна")
+
+    def test_carousel_has_individual_video_types(self):
+        image = {"media_type": 1, "image_versions2": {"candidates": [{"url": "photo.jpg"}]}}
+        video = {"media_type": 2, "image_versions2": {"candidates": [{"url": "cover.jpg"}]}, "video_versions": [{"url": "movie.mp4"}]}
+        with tempfile.TemporaryDirectory() as directory, patch.object(app, "download_binary", side_effect=lambda session, url, base: base.with_suffix(".mp4" if url.endswith(".mp4") else ".jpg")) as download:
+            payload = {"code": "A", "media_type": 8, "carousel_media": [image, video]}
+            record = app.build_post_record(MagicMock(), payload, Path(directory), 1, "https://www.instagram.com/p/A/", True)
+            self.assertEqual(record["media_types"], ["image", "video"])
+            self.assertEqual(download.call_args.args[1], "movie.mp4")
+            record = app.build_post_record(MagicMock(), payload, Path(directory), 1, "https://www.instagram.com/p/A/")
+            self.assertEqual(record["media_types"], ["image", "image"])
+            self.assertEqual(download.call_args.args[1], "cover.jpg")
+
+    def test_empty_comments_are_cached_and_owner_is_checked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "comments.json"
+            app.save_comment_cache(path, "natgeo", [], {"A"})
+            self.assertEqual(app.load_comment_cache(path, "natgeo"), ([], {"A"}))
+            self.assertEqual(app.load_comment_cache(path, "other"), ([], set()))
+
+    def test_comment_pagination_deduplicates_and_rejects_stuck_cursor(self):
+        with patch.object(app, "fetch_comments_page", side_effect=[
+            ([{"pk": "1"}], "next", True), ([{"pk": "1"}, {"pk": "2"}], None, False),
+        ]):
+            self.assertEqual(app.fetch_all_comments(MagicMock(), "A", 0), [{"pk": "1"}, {"pk": "2"}])
+        with patch.object(app, "fetch_comments_page", return_value=([{"pk": "1"}], "next", True)):
+            with self.assertRaises(app.ExportError):
+                app.fetch_all_comments(MagicMock(), "A", 0)
+
+    def test_refresh_replaces_comments_and_filters_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".comments.json"
+            app.save_comment_cache(path, "natgeo", [app.build_comment_record({"pk": "old", "text": "old"}, "A"), app.build_comment_record({"pk": "other"}, "B")], {"A", "B"})
+            args = app.parse_args(["comments", "natgeo", "--sessionid", "test", "--refresh", "--output-dir", directory])
+            with (
+                patch.object(app, "_session_from_sessionid", return_value=MagicMock()),
+                patch.object(app, "_save_config"),
+                patch.object(app, "fetch_profile_info", return_value=({"username": "natgeo", "mediacount": 1}, ["https://www.instagram.com/p/A/"], None, "1")),
+                patch.object(app, "collect_post_links", return_value=["https://www.instagram.com/p/A/"]),
+                patch.object(app, "fetch_authenticated_timeline_page", return_value=(["https://www.instagram.com/p/A/"], None, False)),
+                patch.object(app, "fetch_all_comments", return_value=[{"pk": "new", "text": "fresh"}]) as fetch,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(app.run_comments(args), 0)
+                fetch.assert_called_once()
+            records, completed = app.load_comment_cache(path, "natgeo")
+            self.assertEqual({record["comment_id"] for record in records}, {"new", "other"})
+            self.assertEqual(completed, {"A", "B"})
+            csv = (Path(directory) / "comments.csv").read_text(encoding="utf-8-sig")
+            self.assertIn("fresh", csv)
+            self.assertNotIn("other", csv)
+
+    def test_partial_export_is_saved_and_returns_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = app.parse_args(["all", "natgeo", "--output-dir", directory])
+            with (
+                patch.object(app, "InstagramBrowser"),
+                patch.object(app, "preflight_instagram_access"),
+                patch.object(app, "fetch_profile_info", return_value=({"username": "natgeo", "mediacount": 2}, [], None, "1")),
+                patch.object(app, "fetch_authenticated_timeline_page", return_value=([f"https://www.instagram.com/p/{code}/" for code in "AB"], None, False)),
+                patch.object(app, "scrape_post_payload", side_effect=[{}, app.ExportError("failed")]),
+                patch.object(app, "build_post_record", return_value={"shortcode": "A"}),
+                patch.object(app, "generate_html"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(app.run(args), 4)
+            state = app.load_export_state(Path(directory), args)
+            self.assertFalse(state["completed"])
+            self.assertEqual(state["post_records"], [{"shortcode": "A"}])
+
+    def test_interruption_keeps_completed_posts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = app.parse_args(["all", "natgeo", "--output-dir", directory])
+            with (
+                patch.object(app, "InstagramBrowser"),
+                patch.object(app, "preflight_instagram_access"),
+                patch.object(app, "fetch_profile_info", return_value=({"username": "natgeo", "mediacount": 2}, [], None, "1")),
+                patch.object(app, "fetch_authenticated_timeline_page", return_value=([f"https://www.instagram.com/p/{code}/" for code in "AB"], None, False)),
+                patch.object(app, "scrape_post_payload", side_effect=[{}, KeyboardInterrupt()]),
+                patch.object(app, "build_post_record", return_value={"shortcode": "A"}),
+                patch.object(app, "generate_html"),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    app.run(args)
+            self.assertEqual(app.load_export_state(Path(directory), args)["post_records"], [{"shortcode": "A"}])
+
     def test_legacy_cache_continues_past_first_page_count(self):
         with tempfile.TemporaryDirectory() as directory:
             args = app.parse_args(["oldest", "natgeo", "--limit", "100"])
@@ -131,6 +290,7 @@ class ExportTests(unittest.TestCase):
                 patch.object(app, "_save_config"),
                 patch.object(app, "fetch_profile_info", return_value=({"username": "natgeo", "mediacount": 1}, ["https://www.instagram.com/p/A/"], None, "1")),
                 patch.object(app, "collect_post_links", return_value=["https://www.instagram.com/p/A/"]),
+                patch.object(app, "fetch_authenticated_timeline_page", return_value=(["https://www.instagram.com/p/A/"], None, False)),
                 patch.object(app, "fetch_all_comments") as fetch,
             ):
                 self.assertEqual(app.run_comments(args), 0)
@@ -153,7 +313,7 @@ class ExportTests(unittest.TestCase):
                 patch.object(app, "collect_post_links", return_value=[f"https://www.instagram.com/p/{code}/" for code in "CBA"]),
                 patch.object(app, "load_export_state", return_value={"post_records": [cached], "avatar_src": "avatar.jpg"}),
                 patch.object(app, "scrape_post_payload", return_value={}),
-                patch.object(app, "build_post_record", side_effect=lambda session, payload, media_dir, index, url: {"shortcode": app.parse_shortcode_from_url(url)}),
+                patch.object(app, "build_post_record", side_effect=lambda session, payload, media_dir, index, url, **kwargs: {"shortcode": app.parse_shortcode_from_url(url)}),
                 patch.object(app, "generate_html") as generate,
                 patch.object(app, "save_export_state") as save,
                 contextlib.redirect_stdout(io.StringIO()),

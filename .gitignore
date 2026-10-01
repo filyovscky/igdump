@@ -3,5 +3,7 @@ __pycache__/
 *.pyc
 exports/
 dist/
+build/
+output/
 *.egg-info/
 .chrome-profile/

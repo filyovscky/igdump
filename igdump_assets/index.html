@@ -271,9 +271,10 @@
       scrollbar-width: thin;
     }}
 
-    .carousel .post-media {{
+    .carousel > * {{
       scroll-snap-align: start;
       flex: 0 0 100%;
+      min-width: 0;
     }}
 
     .carousel-dots {{
@@ -570,19 +571,16 @@
       progress.textContent = `Показано ${{Math.min(cursor, posts.length)}} из ${{posts.length}} постов`;
     }};
 
-    const isVideo = (post) => post.kind_label === "Video";
-
-    const playIcon = `<svg viewBox="0 0 24 24" fill="white"><circle cx="12" cy="12" r="10" fill="rgba(0,0,0,.5)"/><polygon points="10,8 16,12 10,16" fill="white"/></svg>`;
 
     const renderMedia = (post) => {{
       const paths = post.media_paths || [post.local_media_path];
+      const renderItem = (p, i) => post.media_types?.[i] === "video"
+        ? `<video class="post-media" src="${{escapeHtml(p)}}" controls preload="metadata" playsinline></video>`
+        : `<div class="media-wrap" data-src="${{escapeHtml(p)}}"><img class="post-media" src="${{escapeHtml(p)}}" alt="${{escapeHtml(post.alt_text)}}" loading="lazy"></div>`;
       if (paths.length === 1) {{
-        const videoTag = isVideo(post) ? `<div class="play-overlay">${{playIcon}}</div>` : "";
-        return `<div class="media-wrap" data-src="${{escapeHtml(paths[0])}}"><img class="post-media" src="${{escapeHtml(paths[0])}}" alt="${{escapeHtml(post.alt_text)}}" loading="lazy">${{videoTag}}</div>`;
+        return renderItem(paths[0], 0);
       }}
-      const imgs = paths.map((p, i) =>
-        `<div class="media-wrap" data-src="${{escapeHtml(p)}}"><img class="post-media" src="${{escapeHtml(p)}}" alt="${{escapeHtml(post.alt_text)}}" loading="lazy">${{i === 0 && isVideo(post) ? playIcon : ""}}</div>`
-      ).join("");
+      const imgs = paths.map(renderItem).join("");
       const dots = paths.map((_, i) =>
         `<span class="carousel-dot${{i === 0 ? " active" : ""}}"></span>`
       ).join("");
