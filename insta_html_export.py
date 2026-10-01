@@ -476,7 +476,7 @@ def save_post_links(output_dir: Path, args: argparse.Namespace, links: list[str]
     write_json(
         post_links_path(output_dir),
         {
-            "version": 1,
+            "version": 2,
             "job": {
                 "username": args.username,
                 "mode": "profile-links",
@@ -501,7 +501,7 @@ def load_post_links(output_dir: Path, username: str) -> dict[str, Any]:
     return {
         "links": links if isinstance(links, list) else [],
         "total": payload.get("total"),
-        "completed": bool(payload.get("completed")),
+        "completed": payload.get("version") == 2 and bool(payload.get("completed")) and payload.get("cursor") is None,
         "cursor": payload.get("cursor"),
     }
 
@@ -681,7 +681,7 @@ def _scrape_profile_html(username: str) -> tuple[dict[str, Any], list[str], str 
         "username": scraped_username,
         "full_name": display_name,
         "biography": "",
-        "mediacount": len(links),
+        "mediacount": None,
         "followers": 0,
         "followees": 0,
         "avatar_url": "",
@@ -990,7 +990,9 @@ def collect_post_links(
         logger.info("No pagination cursor, returning %s cached links", len(links))
         if total_available and len(links) < total_available:
             logger.warning("Collected %s of %s links before cursor ran out", len(links), total_available)
-        save_post_links(output_dir, args, links, total_available, completed=bool(total_available and len(links) >= total_available), cursor=None)
+            if args.mode == "oldest":
+                raise ExportError("Instagram вернул неполный список без следующей страницы. Первые посты не определены; повторите команду позже.")
+        save_post_links(output_dir, args, links, total_available, completed=True, cursor=None)
         return links
 
     if cache["links"]:
@@ -1000,10 +1002,11 @@ def collect_post_links(
     MAX_IDLE = 3
 
     while True:
-        if total_available and len(links) >= total_available:
-            break
-
         page_links, next_cursor, _has_next = fetch_authenticated_timeline_page(session, username, cursor, user_id=user_id)
+        if _has_next and next_cursor is None:
+            raise ExportError("Instagram сообщает о следующей странице, но не вернул указатель. Сбор ссылок не завершён; повторите команду позже.")
+        if not _has_next:
+            next_cursor = None
         before = len(links)
         links = unique_keep_order(links + page_links)
         new_count = len(links) - before
@@ -1025,7 +1028,9 @@ def collect_post_links(
 
     if total_available and len(links) < total_available:
         logger.warning("Collected %s of %s links before pagination stopped", len(links), total_available)
-    save_post_links(output_dir, args, links, total_available, completed=bool(total_available and len(links) >= total_available), cursor=cursor)
+    save_post_links(output_dir, args, links, total_available, completed=cursor is None, cursor=cursor)
+    if args.mode == "oldest" and (cursor is not None or (total_available and len(links) < total_available)):
+        raise ExportError("Не удалось дойти до начала истории профиля. Ссылки сохранены; повторите ту же команду позже для продолжения.")
     return links
 
 
@@ -1277,9 +1282,7 @@ def run(args: argparse.Namespace) -> int:
         browser.ensure_logged_in()
         preflight_instagram_access(browser)
         session = browser.authenticated_session()
-        public_session = public_api_session()
-
-        profile, _, _, user_id = fetch_profile_info(public_session, args.username)
+        profile, _, _, user_id = fetch_profile_info(session, args.username)
         logger.info("Resolved @%s profile metadata", profile["username"])
 
         # Try to resume from saved cursor; if missing, fetch first page fresh.
@@ -1289,12 +1292,16 @@ def run(args: argparse.Namespace) -> int:
             initial_links: list[str] = []
             end_cursor: str | None = None
         else:
-            initial_links, end_cursor, _has_next = fetch_authenticated_timeline_page(session, profile["username"], None)
+            initial_links, end_cursor, _has_next = fetch_authenticated_timeline_page(session, profile["username"], None, user_id=user_id)
+            if _has_next and end_cursor is None:
+                raise ExportError("Instagram не вернул указатель следующей страницы. Повторите команду позже: начало истории пока не найдено.")
+            if not _has_next:
+                end_cursor = None
 
         all_links = collect_post_links(
             session=session,
             username=profile["username"],
-            total_available=int(profile.get("mediacount") or len(initial_links)),
+            total_available=int(profile.get("mediacount") or 0),
             output_dir=output_dir,
             args=args,
             seed_links=initial_links,
@@ -1319,9 +1326,22 @@ def run(args: argparse.Namespace) -> int:
             avatar_file = output_dir / avatar_name
         else:
             avatar_url = profile.get("avatar_url")
-            if not avatar_url:
-                raise ExportError(f"Could not determine avatar URL for @{profile['username']}")
-            avatar_file = download_binary(session, avatar_url, output_dir / "avatar")
+            avatar_file = output_dir / "avatar-placeholder.svg"
+            if avatar_url:
+                try:
+                    avatar_file = download_binary(session, avatar_url, output_dir / "avatar")
+                except (ExportError, requests.RequestException, OSError) as exc:
+                    logger.warning("Не удалось загрузить аватар: %s. Продолжаем без него.", exc)
+            else:
+                logger.info("Аватар недоступен; продолжаем выгрузку постов.")
+            if avatar_file.name == "avatar-placeholder.svg":
+                avatar_file.write_text(
+                    '<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96">'
+                    '<circle cx="48" cy="48" r="48" fill="#e5e7eb"/>'
+                    '<text x="48" y="60" text-anchor="middle" font-family="sans-serif" font-size="36" fill="#6b7280">'
+                    + escape(profile["username"][:1].upper()) + '</text></svg>',
+                    encoding="utf-8",
+                )
             avatar_name = avatar_file.name
 
         # Separate cached and new posts
@@ -1896,7 +1916,7 @@ def run_comments(args: argparse.Namespace) -> int:
     all_links = collect_post_links(
         session=session,
         username=username,
-        total_available=int(mediacount or len(initial_links)),
+        total_available=int(mediacount or 0),
         output_dir=output_dir,
         args=args,
         seed_links=initial_links,

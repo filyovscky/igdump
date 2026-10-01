@@ -52,6 +52,55 @@ class CommandTests(unittest.TestCase):
 
 
 class ExportTests(unittest.TestCase):
+    def test_legacy_cache_continues_past_first_page_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = app.parse_args(["oldest", "natgeo", "--limit", "100"])
+            root = Path(directory)
+            app.write_json(app.post_links_path(root), {
+                "version": 1, "job": {"username": "natgeo"},
+                "links": ["new"], "total": 1, "completed": True, "cursor": "next",
+            })
+            with patch.object(app, "fetch_authenticated_timeline_page", side_effect=[
+                (["middle"], "last", True), (["old"], None, False),
+            ]) as fetch:
+                links = app.collect_post_links(MagicMock(), "natgeo", 1, root, args, [], None, "123")
+            self.assertEqual(links, ["new", "middle", "old"])
+            self.assertEqual(fetch.call_count, 2)
+            self.assertEqual(fetch.call_args_list[0].args[2], "next")
+            self.assertTrue(app.load_post_links(root, "natgeo")["completed"])
+
+    def test_unknown_total_follows_cursor_to_end(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = app.parse_args(["oldest", "natgeo", "--limit", "100"])
+            with patch.object(app, "fetch_authenticated_timeline_page", return_value=(["old"], None, False)) as fetch:
+                links = app.collect_post_links(MagicMock(), "natgeo", 0, Path(directory), args, ["new"], "next", "123")
+            self.assertEqual(links, ["new", "old"])
+            fetch.assert_called_once()
+
+    def test_oldest_rejects_incomplete_timeline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = app.parse_args(["oldest", "natgeo", "--limit", "100"])
+            with self.assertRaises(app.ExportError):
+                app.collect_post_links(MagicMock(), "natgeo", 200, Path(directory), args, ["new"], None, "123")
+
+    def test_missing_avatar_does_not_block_export(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = app.parse_args(["oldest", "natgeo", "--limit", "100", "--output-dir", directory])
+            with (
+                patch.object(app, "InstagramBrowser"),
+                patch.object(app, "preflight_instagram_access"),
+                patch.object(app, "fetch_profile_info", return_value=({"username": "natgeo", "mediacount": None, "avatar_url": ""}, [], None, "123")),
+                patch.object(app, "fetch_authenticated_timeline_page", return_value=(["https://www.instagram.com/p/A/"], None, False)) as fetch,
+                patch.object(app, "scrape_post_payload", return_value={}),
+                patch.object(app, "build_post_record", return_value={"shortcode": "A"}),
+                patch.object(app, "generate_html") as generate,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(app.run(args), 0)
+            self.assertEqual(fetch.call_args.kwargs["user_id"], "123")
+            self.assertTrue((Path(directory) / "avatar-placeholder.svg").exists())
+            self.assertEqual(generate.call_args.kwargs["post_records"], [{"shortcode": "A"}])
+
     def test_interrupted_download_is_not_reused(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory) / "post"
