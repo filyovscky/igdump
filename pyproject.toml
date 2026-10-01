@@ -1,0 +1,16 @@
+[project]
+name = "igdump"
+version = "0.2.0"
+description = "Export Instagram posts to a static HTML feed with local media"
+requires-python = ">=3.11"
+dependencies = [
+    "playwright>=1.40",
+    "requests>=2.31",
+]
+
+[project.scripts]
+igdump = "insta_html_export:main"
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.backends._legacy:_Backend"

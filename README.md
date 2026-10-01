@@ -1,90 +1,73 @@
-By https://t.me/cpb_msk OSINT communtiy
-
 # igdump
 
-Exports an Instagram account's posts into a self-contained HTML feed with all media saved locally.
+Выгружает посты Instagram с медиа в локальный HTML-архив, а комментарии —
+в HTML со статистикой и CSV для Excel.
 
-## Features
+## Установка
 
-- Dumps all posts from an account or only the N earliest ones. No need to scroll manually! 
-- Downloads photos and video thumbnails into a `media/` folder next to the HTML
-- Resumes interrupted runs from where they left off — cursor and collected links are persisted
-- Generates a single `index.html` with lazy-loaded post cards
+Нужны Python 3.11+ и Google Chrome (для выгрузки постов).
 
-## Requirements
-
-```
-python >= 3.11
-playwright (chromium)
-requests
+```console
+pip install -r requirements.txt
 ```
 
-```bash
-pip install playwright requests
-playwright install chromium
+## Команды
+
+Первые **100 постов с начала истории профиля**, ранние сверху:
+
+```console
+python insta_html_export.py oldest @kharlamova_alena --limit 100
 ```
 
-Google Chrome must also be installed — it is used to hold the Instagram session.
+Все доступные посты, новые сверху:
 
-## Authentication
-
-On the first run a Chrome window will open. Log into Instagram manually, then press Enter in the terminal. The session is saved to `~/.insta-export/chrome-profile` and reused on subsequent runs.
-
-## Usage
-
-### All posts
-
-```bash
-python igdump.py all <username>
+```console
+python insta_html_export.py all @kharlamova_alena
 ```
 
-### N earliest posts
+Комментарии ко всем постам или только к последним 100:
 
-```bash
-python igdump.py oldest <username> --limit 50
+```console
+python insta_html_export.py comments @kharlamova_alena
+python insta_html_export.py comments @kharlamova_alena --limit 100
 ```
 
-### Options
+**Выбирайте одну команду:** `all`, `oldest` или `comments`. Имя профиля
+принимается с `@` или без. Количество задаётся через `--limit 100`;
+запись `all oldest 100 @username` неверна. В `oldest` лимит обязателен
+и больше нуля; в `comments` отсутствие лимита или `--limit 0` означает все посты.
 
-| Option | Default | Description |
-|---|---|---|
-| `--output-dir` | `./exports/<username>-<mode>` | Where to save the export |
-| `--batch-size` | `9` | Cards to render per scroll batch |
-| `--browser-profile-dir` | `~/.insta-export/chrome-profile` | Path to the Chrome profile with the session |
-| `--headful` | off | Keep the browser window visible throughout |
+Для `oldest` сначала собираются ссылки на все публикации, затем скачиваются
+медиа выбранных первых N постов. Если Instagram прервёт выдачу, появится
+предупреждение: самые ранние посты тогда не гарантированы. Закреплённые
+публикации могут влиять на порядок списка Instagram.
 
-### Examples
+## Вход и результат
 
-```bash
-# All posts, custom output directory
-python igdump.py all natgeo --output-dir ~/Desktop/natgeo-export
+При первом запуске `all`/`oldest` откроется Chrome. Войдите в Instagram
+и нажмите Enter в терминале. Сессия сохранится для следующих запусков.
 
-# 100 earliest posts with the browser visible
-python igdump.py oldest someuser --limit 100 --headful
-```
+Для `comments` скрипт предложит ввести cookie `sessionid` и сохранит её
+локально в `~/.insta-export/config.json`. Найти её можно в Chrome:
+F12 → Application → Cookies → instagram.com → sessionid.
+Доступны публичные профили и те, которые видит ваш аккаунт.
 
-## Export layout
+Результаты лежат в `exports/`:
 
-```
-exports/
-└── username-all/
-    ├── index.html          # open directly in any browser
-    ├── avatar.<ext>
-    ├── media/
-    │   ├── 0001-<shortcode>.<ext>
-    │   └── ...
-    ├── .post-links.json    # cached links and pagination cursor
-    └── .export-state.json
-```
+- `USERNAME-oldest-100/index.html` или `USERNAME-all/index.html` — посты с локальными медиа;
+- `USERNAME-comments-N/comments.html` и `comments.csv` — комментарии и статистика (`N=0` для всех).
 
-## Resuming an interrupted run
+Откройте HTML в браузере. Повтор той же команды использует кеш.
 
-Re-run the same command — the script picks up the saved pagination cursor and skips already downloaded media.
+## Полезные параметры
 
-> To start fresh, delete `.post-links.json` and `.export-state.json` from the export folder.
+| Параметр | Что делает |
+|---|---|
+| `--output-dir "C:\Archives\instagram"` | Своя папка результата |
+| `--dry-run` | Считает выбранные посты и кеширует ссылки, без загрузки медиа и комментариев; требует доступа к Instagram |
+| `--headful` | Оставляет Chrome видимым при выгрузке постов |
+| `--comment-delay 3` | Задержка запросов комментариев в секундах (по умолчанию 2) |
+| `--verbose` / `--quiet` | Подробный / минимальный вывод |
+| `--help` | Справка, например `python insta_html_export.py oldest --help` |
 
-## Limitations
-
-- Only works with **public** accounts or accounts the logged-in user follows
-- Instagram may temporarily rate-limit the session — the script will report this and exit; just wait a few minutes and retry
-- Videos are saved as thumbnail images, not the actual video file
+Параметры указываются после выбранной команды.

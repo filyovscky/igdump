@@ -2,18 +2,86 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import logging
 import mimetypes
+import random
 import re
+import time
 import sys
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from html import escape
+from importlib.metadata import version as _pkg_version, PackageNotFoundError
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+# ── Debug log (structured, AI-readable) ──────────────────────────────────────
+
+_DEBUG_EVENTS: list[dict[str, Any]] = []
+_DEBUG_LOG_PATH: Path | None = None
+
+def _debug_event(event_type: str, message: str, **context) -> None:
+    entry: dict[str, Any] = {
+        "t": datetime.now(UTC).isoformat(),
+        "event": event_type,
+        "msg": message,
+    }
+    if context:
+        entry["ctx"] = {k: v for k, v in context.items() if v is not None}
+    _DEBUG_EVENTS.append(entry)
+    logger.debug("[dbg] %s: %s", event_type, message)
+
+
+def _save_debug_log(output_dir: Path) -> None:
+    global _DEBUG_LOG_PATH
+    path = output_dir / ".debug_log.json"
+    try:
+        path.write_text(
+            json.dumps(_DEBUG_EVENTS, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        _DEBUG_LOG_PATH = path
+    except OSError as exc:
+        logger.warning("Could not save debug log: %s", exc)
+
+
+def _patch_session_for_logging(session: requests.Session) -> None:
+    """Monkey-patch session.send so every HTTP call is logged."""
+    original_send = session.send
+
+    def logged_send(request, **kwargs):
+        _debug_event("http.send", f"{request.method} {request.url}",
+                     method=request.method,
+                     url=re.sub(r"(sessionid|csrftoken)=[^&]+", r"\1=***", str(request.url)))
+        t0 = time.monotonic()
+        try:
+            response = original_send(request, **kwargs)
+            elapsed = int((time.monotonic() - t0) * 1000)
+            _debug_event("http.done", f"{response.status_code} {request.method} {request.url}",
+                         status=response.status_code,
+                         elapsed_ms=elapsed,
+                         method=request.method,
+                         url=re.sub(r"(sessionid|csrftoken)=[^&]+", r"\1=***", str(request.url)))
+            return response
+        except requests.RequestException as exc:
+            elapsed = int((time.monotonic() - t0) * 1000)
+            _debug_event("http.error", f"{exc}",
+                         error=str(exc),
+                         elapsed_ms=elapsed,
+                         method=request.method,
+                         url=re.sub(r"(sessionid|csrftoken)=[^&]+", r"\1=***", str(request.url)))
+            raise
+
+    session.send = logged_send  # type: ignore[method-assign]
+
 import requests
-from playwright.sync_api import BrowserContext, Page, Playwright, TimeoutError, sync_playwright
+from playwright.sync_api import BrowserContext, Error as PlaywrightError, Page, Playwright, TimeoutError, sync_playwright
+
+logger = logging.getLogger("igdump")
 
 
 IG_BASE_URL = "https://www.instagram.com"
@@ -34,512 +102,16 @@ IG_API_HEADERS = {
 }
 LOGIN_URL = f"{IG_BASE_URL}/accounts/login/"
 DEFAULT_PROFILE_DIR = Path.home() / ".insta-export" / "chrome-profile"
-SCROLL_PAUSE_MS = 1400
 POST_WAIT_MS = 2500
 NAVIGATION_TIMEOUT_MS = 30_000
-MAX_IDLE_SCROLLS = 6
-PUBLIC_PROFILE_DOC_ID = "7950326061742207"
 AUTH_PROFILE_DOC_ID = "7898261790222653"
+TEMPLATE_DIR = Path(__file__).parent / "templates"
+HTML_TEMPLATE = (TEMPLATE_DIR / "index.html").read_text(encoding="utf-8")
 
-
-HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="ru">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{title}</title>
-  <style>
-    :root {{
-      --bg: #fafafa;
-      --surface: rgba(255, 255, 255, 0.92);
-      --surface-strong: #ffffff;
-      --text: #111111;
-      --muted: #6b7280;
-      --line: rgba(17, 17, 17, 0.08);
-      --shadow: 0 24px 60px rgba(17, 24, 39, 0.08);
-      --accent: #ff4f8b;
-      --accent-2: #ff8a00;
-      --radius: 26px;
-      --feed-width: 540px;
-    }}
-
-    * {{
-      box-sizing: border-box;
-    }}
-
-    body {{
-      margin: 0;
-      color: var(--text);
-      font-family: "Avenir Next", "Helvetica Neue", Helvetica, Arial, sans-serif;
-      background:
-        radial-gradient(circle at top left, rgba(255, 79, 139, 0.10), transparent 32%),
-        radial-gradient(circle at top right, rgba(255, 138, 0, 0.10), transparent 24%),
-        linear-gradient(180deg, #fefefe 0%, #f8f8f8 50%, #f5f5f5 100%);
-    }}
-
-    a {{
-      color: inherit;
-    }}
-
-    .topbar {{
-      position: sticky;
-      top: 0;
-      z-index: 20;
-      backdrop-filter: blur(14px);
-      background: rgba(255, 255, 255, 0.86);
-      border-bottom: 1px solid var(--line);
-    }}
-
-    .topbar-inner {{
-      max-width: 1080px;
-      margin: 0 auto;
-      padding: 18px 24px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-    }}
-
-    .brand {{
-      display: flex;
-      align-items: center;
-      gap: 14px;
-      min-width: 0;
-    }}
-
-    .brand-mark {{
-      width: 38px;
-      height: 38px;
-      border-radius: 12px;
-      background: linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%);
-      box-shadow: 0 10px 24px rgba(255, 79, 139, 0.28);
-      position: relative;
-      flex: 0 0 auto;
-    }}
-
-    .brand-mark::before {{
-      content: "";
-      position: absolute;
-      inset: 8px;
-      border: 2px solid rgba(255, 255, 255, 0.95);
-      border-radius: 10px;
-    }}
-
-    .brand-mark::after {{
-      content: "";
-      position: absolute;
-      width: 7px;
-      height: 7px;
-      right: 8px;
-      top: 8px;
-      border-radius: 50%;
-      background: rgba(255, 255, 255, 0.95);
-    }}
-
-    .brand-copy {{
-      min-width: 0;
-    }}
-
-    .brand-title {{
-      font-size: 1.15rem;
-      font-weight: 700;
-      letter-spacing: -0.03em;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }}
-
-    .brand-meta {{
-      margin-top: 2px;
-      color: var(--muted);
-      font-size: 0.92rem;
-    }}
-
-    .stats-pill {{
-      flex: 0 0 auto;
-      padding: 10px 14px;
-      border-radius: 999px;
-      background: rgba(17, 17, 17, 0.04);
-      font-size: 0.92rem;
-      color: var(--muted);
-      white-space: nowrap;
-    }}
-
-    .page {{
-      max-width: 1080px;
-      margin: 0 auto;
-      padding: 32px 24px 56px;
-    }}
-
-    .profile-card {{
-      display: grid;
-      grid-template-columns: 112px minmax(0, 1fr);
-      gap: 24px;
-      padding: 28px;
-      border: 1px solid var(--line);
-      border-radius: 32px;
-      background: var(--surface);
-      box-shadow: var(--shadow);
-      margin-bottom: 28px;
-    }}
-
-    .avatar-wrap {{
-      width: 112px;
-      height: 112px;
-      padding: 4px;
-      border-radius: 50%;
-      background: linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%);
-    }}
-
-    .avatar {{
-      display: block;
-      width: 100%;
-      height: 100%;
-      border-radius: 50%;
-      object-fit: cover;
-      background: #ececec;
-      border: 4px solid white;
-    }}
-
-    .profile-head {{
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      gap: 12px 16px;
-      margin-bottom: 14px;
-    }}
-
-    .username {{
-      font-size: clamp(1.4rem, 1.6vw, 1.7rem);
-      font-weight: 700;
-      letter-spacing: -0.04em;
-    }}
-
-    .realname {{
-      color: var(--muted);
-      font-size: 1rem;
-    }}
-
-    .meta-grid {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 12px 20px;
-      margin-bottom: 14px;
-      font-size: 0.95rem;
-    }}
-
-    .meta-grid strong {{
-      color: var(--text);
-    }}
-
-    .bio {{
-      white-space: pre-wrap;
-      line-height: 1.5;
-      color: #232323;
-    }}
-
-    .feed-shell {{
-      display: flex;
-      justify-content: center;
-    }}
-
-    .feed-column {{
-      width: min(100%, var(--feed-width));
-    }}
-
-    .post-card {{
-      margin-bottom: 22px;
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      overflow: hidden;
-      background: var(--surface-strong);
-      box-shadow: 0 20px 48px rgba(17, 24, 39, 0.08);
-      transform: translateY(18px);
-      opacity: 0;
-      animation: slide-in 360ms ease forwards;
-    }}
-
-    .post-head {{
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      padding: 16px 18px;
-    }}
-
-    .post-head .avatar {{
-      width: 40px;
-      height: 40px;
-      border: 0;
-    }}
-
-    .post-owner {{
-      flex: 1 1 auto;
-      min-width: 0;
-    }}
-
-    .post-owner strong,
-    .post-owner span {{
-      display: block;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }}
-
-    .post-owner span {{
-      margin-top: 2px;
-      color: var(--muted);
-      font-size: 0.88rem;
-    }}
-
-    .post-link {{
-      flex: 0 0 auto;
-      color: var(--muted);
-      text-decoration: none;
-      font-size: 0.9rem;
-    }}
-
-    .post-media {{
-      display: block;
-      width: 100%;
-      height: auto;
-      object-fit: contain;
-      background: #efefef;
-    }}
-
-    .post-body {{
-      padding: 16px 18px 20px;
-    }}
-
-    .post-stats {{
-      display: flex;
-      gap: 14px;
-      flex-wrap: wrap;
-      margin-bottom: 10px;
-      font-size: 0.93rem;
-    }}
-
-    .post-stats span {{
-      padding: 8px 10px;
-      border-radius: 999px;
-      background: rgba(17, 17, 17, 0.04);
-    }}
-
-    .caption {{
-      white-space: pre-wrap;
-      line-height: 1.55;
-      overflow-wrap: anywhere;
-    }}
-
-    .caption-empty {{
-      color: var(--muted);
-      font-style: italic;
-    }}
-
-    .render-progress {{
-      text-align: center;
-      color: var(--muted);
-      font-size: 0.93rem;
-      margin: 12px 0 6px;
-    }}
-
-    .loader {{
-      width: 100%;
-      display: flex;
-      justify-content: center;
-      padding: 14px 0 0;
-      color: var(--muted);
-      font-size: 0.95rem;
-    }}
-
-    .loader.hidden {{
-      display: none;
-    }}
-
-    .empty-state {{
-      text-align: center;
-      padding: 44px 24px;
-      border: 1px dashed var(--line);
-      border-radius: var(--radius);
-      background: rgba(255, 255, 255, 0.8);
-      color: var(--muted);
-    }}
-
-    @keyframes slide-in {{
-      from {{
-        opacity: 0;
-        transform: translateY(18px);
-      }}
-      to {{
-        opacity: 1;
-        transform: translateY(0);
-      }}
-    }}
-
-    @media (max-width: 760px) {{
-      .topbar-inner,
-      .page {{
-        padding-left: 14px;
-        padding-right: 14px;
-      }}
-
-      .profile-card {{
-        grid-template-columns: 1fr;
-        justify-items: center;
-        text-align: center;
-        gap: 18px;
-      }}
-
-      .profile-head,
-      .meta-grid {{
-        justify-content: center;
-      }}
-
-      .stats-pill {{
-        display: none;
-      }}
-
-      .post-card {{
-        border-radius: 22px;
-      }}
-    }}
-  </style>
-</head>
-<body>
-  <header class="topbar">
-    <div class="topbar-inner">
-      <div class="brand">
-        <div class="brand-mark" aria-hidden="true"></div>
-        <div class="brand-copy">
-          <div class="brand-title">{brand_title}</div>
-          <div class="brand-meta">{brand_meta}</div>
-        </div>
-      </div>
-      <div class="stats-pill">{stats_pill}</div>
-    </div>
-  </header>
-
-  <main class="page">
-    <section class="profile-card">
-      <div class="avatar-wrap">
-        <img class="avatar" src="{avatar_src}" alt="Avatar @{username}">
-      </div>
-      <div>
-        <div class="profile-head">
-          <div class="username">@{username}</div>
-          <div class="realname">{full_name}</div>
-        </div>
-        <div class="meta-grid">
-          <div><strong>{post_count}</strong> posts</div>
-          <div><strong>{followers}</strong> followers</div>
-          <div><strong>{followees}</strong> following</div>
-          <div><strong>{mode_label}</strong></div>
-        </div>
-        <div class="bio">{bio}</div>
-      </div>
-    </section>
-
-    <section class="feed-shell">
-      <div class="feed-column">
-        <div class="render-progress" id="render-progress"></div>
-        <div id="feed"></div>
-        <div id="empty" class="empty-state" hidden>Посты не найдены.</div>
-        <div id="loader" class="loader">Загружаю следующую порцию…</div>
-        <div id="sentinel"></div>
-      </div>
-    </section>
-  </main>
-
-  <script id="post-data" type="application/json">{post_data}</script>
-  <script>
-    const payload = JSON.parse(document.getElementById("post-data").textContent);
-    const posts = payload.posts || [];
-    const feed = document.getElementById("feed");
-    const empty = document.getElementById("empty");
-    const sentinel = document.getElementById("sentinel");
-    const loader = document.getElementById("loader");
-    const progress = document.getElementById("render-progress");
-    const batchSize = Math.max(1, payload.batch_size || 9);
-    let cursor = 0;
-
-    const escapeHtml = (value) => value
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;")
-      .replaceAll('"', "&quot;");
-
-    const formatCaption = (caption) => {{
-      if (!caption) {{
-        return '<div class="caption caption-empty">Без описания</div>';
-      }}
-      return `<div class="caption">${{escapeHtml(caption)}}</div>`;
-    }};
-
-    const renderProgress = () => {{
-      if (!posts.length) {{
-        progress.textContent = "";
-        return;
-      }}
-      progress.textContent = `Показано ${{Math.min(cursor, posts.length)}} из ${{posts.length}} постов`;
-    }};
-
-    const createCard = (post, index) => {{
-      const card = document.createElement("article");
-      card.className = "post-card";
-      card.style.animationDelay = `${{Math.min(index * 35, 220)}}ms`;
-      card.innerHTML = `
-        <div class="post-head">
-          <img class="avatar" src="${{escapeHtml(payload.profile.avatar_src)}}" alt="">
-          <div class="post-owner">
-            <strong>@${{escapeHtml(payload.profile.username)}}</strong>
-            <span>${{escapeHtml(post.date_label)}}</span>
-          </div>
-          <a class="post-link" href="${{escapeHtml(post.instagram_url)}}" target="_blank" rel="noreferrer">Instagram</a>
-        </div>
-        <img class="post-media" src="${{escapeHtml(post.local_media_path)}}" alt="${{escapeHtml(post.alt_text)}}" loading="lazy">
-        <div class="post-body">
-          <div class="post-stats">
-            <span>${{escapeHtml(post.likes_label)}}</span>
-            <span>${{escapeHtml(post.comments_label)}}</span>
-            <span>${{escapeHtml(post.kind_label)}}</span>
-          </div>
-          ${{formatCaption(post.caption)}}
-        </div>
-      `;
-      return card;
-    }};
-
-    const renderNextBatch = () => {{
-      if (!posts.length) {{
-        empty.hidden = false;
-        loader.classList.add("hidden");
-        return;
-      }}
-
-      const chunk = posts.slice(cursor, cursor + batchSize);
-      chunk.forEach((post, idx) => feed.appendChild(createCard(post, idx)));
-      cursor += chunk.length;
-      renderProgress();
-
-      if (cursor >= posts.length) {{
-        loader.classList.add("hidden");
-        observer.disconnect();
-      }}
-    }};
-
-    const observer = new IntersectionObserver((entries) => {{
-      for (const entry of entries) {{
-        if (entry.isIntersecting) {{
-          renderNextBatch();
-        }}
-      }}
-    }}, {{ rootMargin: "220px 0px" }});
-
-    renderNextBatch();
-    observer.observe(sentinel);
-  </script>
-</body>
-</html>
-"""
+try:
+    VERSION = _pkg_version("igdump")
+except PackageNotFoundError:
+    VERSION = "0.2.0"
 
 
 class ExportError(RuntimeError):
@@ -604,11 +176,11 @@ class InstagramBrowser:
         page = self.require_context().new_page()
         try:
             page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
-        except TimeoutError:
-            pass
+        except (TimeoutError, PlaywrightError):
+            logger.debug("Login page failed to load via automation; waiting for manual login")
 
-        print(f"[auth] No saved Instagram session in {self.profile_dir}")
-        print("[auth] A Chrome window was opened. Log into Instagram there, then return here.")
+        logger.warning("No saved Instagram session in %s", self.profile_dir)
+        logger.warning("A Chrome window was opened. Log into Instagram there, then return here.")
         try:
             input("Press Enter after the Instagram home page is fully loaded, or Ctrl+C to abort: ")
         finally:
@@ -620,24 +192,18 @@ class InstagramBrowser:
                 "and rerun the command."
             )
 
-        print(f"[auth] Instagram session saved in {self.profile_dir}")
+        logger.info("Instagram session saved in %s", self.profile_dir)
 
     def open_page(self, url: str) -> Page:
         page = self.require_context().new_page()
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
+            page.goto(url, wait_until="load", timeout=NAVIGATION_TIMEOUT_MS)
         except TimeoutError:
-            pass
+            logger.debug("Timeout loading %s, continuing with partial page", url)
         return page
 
     def authenticated_session(self) -> requests.Session:
-        session = requests.Session()
-        session.headers.update(
-            {
-                **IG_API_HEADERS,
-                "User-Agent": IG_MOBILE_USER_AGENT,
-            }
-        )
+        session = _make_session()
         for cookie in self.require_context().cookies():
             session.cookies.set(
                 cookie["name"],
@@ -651,7 +217,7 @@ class InstagramBrowser:
         return session
 
 
-def public_api_session() -> requests.Session:
+def _make_session() -> requests.Session:
     session = requests.Session()
     session.headers.update(
         {
@@ -662,14 +228,80 @@ def public_api_session() -> requests.Session:
     return session
 
 
-def parse_args() -> argparse.Namespace:
+def public_api_session() -> requests.Session:
+    """Unauthenticated session — no cookies. Works for public profiles."""
+    return _make_session()
+
+
+def instagram_username(value: str) -> str:
+    username = value.removeprefix("@")
+    if not re.fullmatch(r"[A-Za-z0-9._]{1,30}", username):
+        raise argparse.ArgumentTypeError("Укажите имя профиля, например @kharlamova_alena, без URL и пробелов.")
+    return username
+
+
+def positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("Ожидается целое число больше 0.") from None
+    if number <= 0:
+        raise argparse.ArgumentTypeError("Ожидается целое число больше 0.")
+    return number
+
+
+def nonnegative_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("Ожидается целое число от 0.") from None
+    if number < 0:
+        raise argparse.ArgumentTypeError("Ожидается целое число от 0.")
+    return number
+
+
+def nonnegative_delay(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("Ожидается конечное число секунд от 0.") from None
+    if not 0 <= number < float("inf"):
+        raise argparse.ArgumentTypeError("Ожидается конечное число секунд от 0.")
+    return number
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Экспортирует Instagram-посты в статический HTML-фид через logged-in Chrome session."
+        description="Выгрузка Instagram в локальный HTML-архив. Выберите одну команду: all, oldest или comments.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Примеры:
+  python insta_html_export.py all @kharlamova_alena
+      Все доступные посты; новые сверху.
+  python insta_html_export.py oldest @kharlamova_alena --limit 100
+      Первые 100 постов с начала истории профиля; самый ранний сверху.
+  python insta_html_export.py comments @kharlamova_alena --limit 100
+      Комментарии к 100 последним постам (0 или без --limit = все).
+
+all и oldest — отдельные команды, их нельзя писать вместе.
+Число постов указывается как --limit 100, а не отдельным аргументом.
+Имя профиля принимается с @ или без него.
+Подробная справка: python insta_html_export.py oldest --help
+
+Для oldest нужно пройти список публикаций до конца истории профиля,
+после чего скачиваются медиа только выбранных первых N постов.
+Результат all/oldest: index.html и media/; comments: comments.html и comments.csv.
+""",
     )
+    parser.add_argument("--version", action="version", version=f"igdump {VERSION}")
     subparsers = parser.add_subparsers(dest="mode", required=True)
 
     common_parent = argparse.ArgumentParser(add_help=False)
-    common_parent.add_argument("username", help="Instagram username без символа @")
+    common_parent.add_argument("username", type=instagram_username, metavar="USERNAME", help="Имя профиля с @ или без: @kharlamova_alena или natgeo.")
+    common_parent.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Собрать и закешировать ссылки, вывести число выбранных постов и выйти без загрузки медиа/комментариев. Требует доступа к Instagram.",
+    )
     common_parent.add_argument(
         "--output-dir",
         default=None,
@@ -677,7 +309,7 @@ def parse_args() -> argparse.Namespace:
     )
     common_parent.add_argument(
         "--batch-size",
-        type=int,
+        type=positive_int,
         default=9,
         help="Сколько карточек подгружать за один экран при прокрутке. По умолчанию 9.",
     )
@@ -691,20 +323,65 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Открывать Chrome в видимом режиме на всём протяжении запуска.",
     )
+    verbosity = common_parent.add_mutually_exclusive_group()
+    verbosity.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Подробный вывод (debug-логи).",
+    )
+    verbosity.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Минимум вывода (только warnings и ошибки).",
+    )
 
     subparsers.add_parser(
         "all",
         parents=[common_parent],
         help="Выгрузить все посты пользователя. Порядок: как в Instagram, от новых к старым.",
+        description="Все доступные посты в index.html с локальными медиа. Порядок списка Instagram: новые сверху.",
+        epilog="Пример: python insta_html_export.py all @kharlamova_alena",
     )
 
     oldest = subparsers.add_parser(
         "oldest",
         parents=[common_parent],
         help="Выгрузить только первые N постов пользователя, от самого раннего к самому позднему.",
+        description="Первые N постов с начала истории профиля, ранние сверху. Сначала собираются ссылки на все доступные посты, затем скачиваются медиа выбранных N.",
+        epilog="Пример: python insta_html_export.py oldest @kharlamova_alena --limit 100",
     )
-    oldest.add_argument("--limit", type=int, required=True, help="Сколько самых ранних постов выгрузить.")
-    return parser.parse_args()
+    oldest.add_argument("--limit", type=positive_int, required=True, metavar="N", help="Количество первых постов с начала истории профиля (больше 0). Если постов меньше N, выгружаются все доступные.")
+
+    comments_parser = subparsers.add_parser(
+        "comments",
+        parents=[common_parent],
+        help="Собрать все комментарии к постам пользователя + статистика комментаторов.",
+        description="Комментарии к постам в comments.html и comments.csv. --limit N выбирает последние N постов; без ограничения обрабатываются все.",
+        epilog="Пример: python insta_html_export.py comments @kharlamova_alena --limit 100",
+    )
+    comments_parser.add_argument(
+        "--limit",
+        type=nonnegative_int,
+        default=0,
+        help="Ограничить количество постов для сбора комментов (0 = все).",
+    )
+    comments_parser.add_argument(
+        "--comment-delay",
+        type=nonnegative_delay,
+        default=2.0,
+        help="Задержка (сек) между запросами комментариев для разных постов. "
+        "Чем выше, тем безопаснее для аккаунта. По умолчанию 2.0.",
+    )
+    comments_parser.add_argument(
+        "--sessionid",
+        default=None,
+        help="Instagram sessionid cookie из вашего Chrome (F12 → Application → Cookies → sessionid). "
+        "Позволяет работать без Playwright/Chrome.",
+    )
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments[:2] == ["all", "oldest"]:
+        parser.error("all и oldest — отдельные команды. Для первых 100 постов: python insta_html_export.py oldest @kharlamova_alena --limit 100")
+    return parser.parse_args(arguments)
 
 
 def safe_slug(value: str) -> str:
@@ -714,7 +391,8 @@ def safe_slug(value: str) -> str:
 def build_job_slug(args: argparse.Namespace) -> str:
     if args.mode == "all":
         return f"{safe_slug(args.username)}-all"
-    return f"{safe_slug(args.username)}-oldest-{args.limit}"
+    limit = getattr(args, "limit", 0)
+    return f"{safe_slug(args.username)}-{args.mode}-{limit}"
 
 
 def format_count(value: int | None) -> str:
@@ -830,7 +508,7 @@ def load_post_links(output_dir: Path, username: str) -> dict[str, Any]:
 
 def existing_binary_path(destination_base: Path) -> Path | None:
     matches = sorted(destination_base.parent.glob(f"{destination_base.name}.*"))
-    return matches[0] if matches else None
+    return next((path for path in matches if path.suffix != ".part" and path.is_file() and path.stat().st_size > 0), None)
 
 
 def extension_for_response(url: str, response: requests.Response) -> str:
@@ -852,23 +530,28 @@ def download_binary(session: requests.Session, url: str, destination_base: Path)
     last_error: Exception | None = None
     for attempt in range(1, 4):
         response = None
+        partial: Path | None = None
         try:
             response = session.get(url, timeout=30, stream=True)
             response.raise_for_status()
             suffix = extension_for_response(url, response)
             destination = destination_base.with_suffix(suffix)
-            with destination.open("wb") as handle:
+            partial = destination.with_suffix(destination.suffix + ".part")
+            with partial.open("wb") as handle:
                 for chunk in response.iter_content(chunk_size=65536):
                     if chunk:
                         handle.write(chunk)
+            partial.replace(destination)
             return destination
         except requests.RequestException as exc:
             last_error = exc
             if attempt < 3:
-                print(f"[retry] Media download failed on attempt {attempt}/3: {exc}. Retrying ...")
+                logger.warning("Media download failed on attempt %s/3: %s. Retrying ...", attempt, exc)
             else:
                 break
         finally:
+            if partial is not None:
+                partial.unlink(missing_ok=True)
             if response is not None:
                 response.close()
 
@@ -915,16 +598,188 @@ def preflight_instagram_access(browser: InstagramBrowser) -> None:
         page.close()
 
 
+def _scrape_profile_html(username: str) -> tuple[dict[str, Any], list[str], str | None, str]:
+    """Scrape profile info from Instagram's public HTML page (no API call).
+
+    Falls back to parsing the server-rendered <script> data and <meta> tags.
+    """
+    _debug_event("profile.source", "HTML scrape", username=username)
+    sess = _make_session()
+    sess.headers["User-Agent"] = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+    resp = sess.get(f"{IG_BASE_URL}/{username}/", timeout=30)
+    resp.raise_for_status()
+    text = resp.text
+    _debug_event("profile.html_size", f"HTML {len(text)} bytes")
+
+    # 1. Try window.__INITIAL_STATE__ (React embedded data)
+    m = re.search(r"window\.__INITIAL_STATE__\s*=\s*(\{.+?\});", text, re.DOTALL)
+    if m:
+        _debug_event("profile.init_state", "__INITIAL_STATE__ found")
+        try:
+            data = json.loads(m.group(1))
+            feed = data.get("xdt_api__v1__feed__user_timeline_graphql_connection") or {}
+            user_obj = feed.get("user") or {}
+            edges = feed.get("edges") or []
+            links = []
+            link_ids: set[str] = set()
+            for e in edges:
+                node = e.get("node") or {}
+                sc = node.get("code") or node.get("shortcode")
+                if sc and sc not in link_ids:
+                    link_ids.add(sc)
+                    links.append(f"{IG_BASE_URL}/p/{sc}/")
+            pi = feed.get("page_info") or {}
+
+            # Try multiple JSON paths for user_id
+            uid = (
+                user_obj.get("id")
+                or (data.get("user") or {}).get("id")
+                or (data.get("users") or {}).get(username, {}).get("id")
+                or data.get("pk")
+                or ""
+            )
+
+            profile = {
+                "username": user_obj.get("username") or username,
+                "full_name": user_obj.get("full_name") or username,
+                "biography": user_obj.get("biography") or "",
+                "mediacount": (user_obj.get("edge_owner_to_timeline_media") or {}).get("count") or 0,
+                "followers": 0,
+                "followees": 0,
+                "avatar_url": user_obj.get("profile_pic_url_hd") or user_obj.get("profile_pic_url") or "",
+            }
+            _debug_event("profile.init_state_ok", f"links={len(links)}, uid={uid!r}", links_count=len(links), uid=uid or None)
+            if not uid:
+                uid = _resolve_user_id_via_search(username)
+            return profile, links, pi.get("end_cursor"), uid
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            _debug_event("profile.json_error", f"__INITIAL_STATE__ parse failed: {exc}")
+
+    _debug_event("profile.init_state", "__INITIAL_STATE__ not found, using regex fallback")
+
+    # 2. Fallback: extract shortcodes and user_id via regex
+    links = list(dict.fromkeys(
+        f"{IG_BASE_URL}/p/{sc}/"
+        for sc in re.findall(r'(?:"code"|"shortcode")\s*:\s*"([A-Za-z0-9_-]{11})"', text)
+        if sc
+    ))
+    if not links:
+        links = list(dict.fromkeys(
+            f"{IG_BASE_URL}{m}" for m in re.findall(r'href="(/p/[^/]+/)', text)
+        ))
+    title_m = re.search(r'<title>([^<]+)', text)
+    raw = title_m.group(1) if title_m else username
+    display_name = raw.split("(")[0].strip() if "(" in raw else raw
+    scraped_username = (re.search(r"@(\w+)", raw).group(1) if re.search(r"@(\w+)", raw) else username)
+
+    uid = _extract_user_id_from_html(text)
+
+    profile = {
+        "username": scraped_username,
+        "full_name": display_name,
+        "biography": "",
+        "mediacount": len(links),
+        "followers": 0,
+        "followees": 0,
+        "avatar_url": "",
+    }
+    _debug_event("profile.regex_fallback", f"links={len(links)}, uid={uid!r}", links_count=len(links), uid=uid or None)
+
+    # 3. If still no user_id, try search API
+    if not uid:
+        uid = _resolve_user_id_via_search(username)
+
+    return profile, links, None, uid
+
+
+def _extract_user_id_from_html(text: str) -> str:
+    """Try multiple methods to find the numeric user id in HTML."""
+    # Method 1: ld+json structured data (most reliable)
+    for ld_m in re.finditer(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', text, re.DOTALL):
+        try:
+            ld = json.loads(ld_m.group(1))
+            if isinstance(ld, dict):
+                val = ld.get("identifier") or ""
+                if val:
+                    return str(val)
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    # Method 2: regex patterns on raw HTML
+    patterns = [
+        r'"pk":\s*(\d{5,})',
+        r'"id":\s*"(\d{5,})"',
+        r'"user_id":\s*"(\d{5,})"',
+        r'"userId":\s*"(\d{5,})"',
+        r'"owner":\s*\{\s*"id":\s*"(\d{5,})"',
+        r'profilePage_(\d{5,})',
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _resolve_user_id_via_search(username: str) -> str:
+    """Resolve numeric user_id via Instagram's search/topsearch API.
+
+    This endpoint has different rate-limit characteristics from web_profile_info.
+    """
+    sess = _make_session()
+    sess.headers["User-Agent"] = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+    for attempt in range(2):
+        try:
+            resp = sess.get(
+                "https://www.instagram.com/web/search/topsearch/",
+                params={"query": username},
+                timeout=15,
+            )
+            if resp.status_code == 429:
+                _debug_event("search.429", f"search API rate limited, retrying in 10s")
+                _safe_sleep(10, jitter=0.2)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            users = data.get("users") or []
+            for entry in users:
+                user_data = entry.get("user") or {}
+                if user_data.get("username", "").lower() == username.lower():
+                    pk = user_data.get("pk") or ""
+                    _debug_event("search.ok", f"user_id={pk}", uid=str(pk))
+                    return str(pk)
+            _debug_event("search.not_found", f"username @{username} not in search results")
+            return ""
+        except requests.RequestException as exc:
+            _debug_event("search.error", f"search API failed: {exc}")
+            if attempt == 0:
+                _safe_sleep(3)
+                continue
+            return ""
+    return ""
+
+
 def fetch_profile_info(session: requests.Session, username: str) -> tuple[dict[str, Any], list[str], str | None, str]:
     response = session.get(
         f"{IG_BASE_URL}/api/v1/users/web_profile_info/?username={username}",
         timeout=30,
     )
+    if response.status_code == 429:
+        logger.warning("API rate limited (429). Trying HTML scrape ...")
+        _debug_event("profile.fallback", "API 429 → HTML scrape", username=username)
+        return _scrape_profile_html(username)
     response.raise_for_status()
     payload = response.json()
     user = payload.get("data", {}).get("user")
     if not user:
         raise ExportError(f"Could not resolve profile @{username}. It may be private or unavailable.")
+    _debug_event("profile.source", "API success", username=username)
 
     media = user.get("edge_owner_to_timeline_media") or {}
     edges = media.get("edges") or []
@@ -960,44 +815,65 @@ def unique_keep_order(values: list[str]) -> list[str]:
     return ordered
 
 
-def fetch_public_timeline_page(
+def _doc_id_guard(payload: dict[str, Any], context: str) -> None:
+    """Check if Instagram responded with a meaningful data shape."""
+    errors = payload.get("errors") or payload.get("error")
+    if errors:
+        logger.warning("Instagram API error for %s (doc_id may be stale): %s", context, errors)
+        raise ExportError(f"Instagram API error during {context}: {errors}")
+
+
+def fetch_user_timeline_rest(
     session: requests.Session,
     user_id: str,
-    after_cursor: str | None,
+    max_id: str | None,
 ) -> tuple[list[str], str | None, bool]:
-    variables: dict[str, Any] = {"id": user_id, "first": 12}
-    if after_cursor:
-        variables["after"] = after_cursor
-    response = session.get(
-        f"{IG_BASE_URL}/graphql/query/",
-        params={
-            "variables": json.dumps(variables, separators=(",", ":")),
-            "doc_id": PUBLIC_PROFILE_DOC_ID,
-            "server_timestamps": "true",
-        },
+    """Fetch user timeline page via the public REST API (no GraphQL doc_id needed).
+
+    GET /api/v1/feed/user/{user_id}/?count=12&max_id=...
+    """
+    params: dict[str, Any] = {"count": 12}
+    if max_id:
+        params["max_id"] = max_id
+
+    resp = session.get(
+        f"{IG_BASE_URL}/api/v1/feed/user/{user_id}/",
+        params=params,
         timeout=30,
+        allow_redirects=False,
     )
-    response.raise_for_status()
-    payload = response.json()
-    media = payload.get("data", {}).get("user", {}).get("edge_owner_to_timeline_media")
-    if not media:
-        raise ExportError("Instagram did not return paginated profile media.")
-    edges = media.get("edges") or []
+    if resp.status_code in (302, 303, 307, 401):
+        raise ExportError(
+            "Instagram redirected to login on REST timeline — your sessionid is expired or invalid."
+        )
+    if resp.status_code == 429:
+        logger.warning("REST timeline rate limited (429). Waiting 30s ...")
+        _safe_sleep(30, jitter=0.2)
+        resp = session.get(
+            f"{IG_BASE_URL}/api/v1/feed/user/{user_id}/",
+            params=params,
+            timeout=30,
+            allow_redirects=False,
+        )
+    resp.raise_for_status()
+    data = resp.json()
+
+    items = data.get("items") or []
     links = []
-    for edge in edges:
-        node = edge.get("node") or {}
-        shortcode = node.get("shortcode")
-        if shortcode:
-            links.append(f"{IG_BASE_URL}/p/{shortcode}/")
-    page_info = media.get("page_info") or {}
-    return links, page_info.get("end_cursor"), bool(page_info.get("has_next_page"))
+    for item in items:
+        code = item.get("code")
+        if code:
+            links.append(f"{IG_BASE_URL}/p/{code}/")
+
+    return links, data.get("next_max_id"), bool(data.get("more_available", False))
 
 
-def fetch_authenticated_timeline_page(
+def _try_graphql_timeline(
     session: requests.Session,
     username: str,
     after_cursor: str | None,
 ) -> tuple[list[str], str | None, bool]:
+    """Try GraphQL timeline; raises ExportError on 403 or API error."""
     variables: dict[str, Any] = {
         "data": {
             "count": 12,
@@ -1006,17 +882,12 @@ def fetch_authenticated_timeline_page(
             "latest_reel_media": True,
         },
         "username": username,
+        "first": 12,
         "__relay_internal__pv__PolarisFeedShareMenurelayprovider": False,
     }
     if after_cursor:
-        variables.update(
-            {
-                "after": after_cursor,
-                "before": None,
-                "first": 12,
-                "last": None,
-            }
-        )
+        variables["after"] = after_cursor
+
     response = session.post(
         f"{IG_BASE_URL}/graphql/query/",
         data={
@@ -1025,12 +896,23 @@ def fetch_authenticated_timeline_page(
             "server_timestamps": "true",
         },
         timeout=30,
+        allow_redirects=False,
     )
+    if response.status_code in (302, 303, 307):
+        raise ExportError("GraphQL endpoint redirected to login — session expired.")
+    if response.status_code == 403:
+        raise ExportError("GraphQL endpoint returned 403 (stale doc_id or missing csrftoken)")
+
     response.raise_for_status()
     payload = response.json()
+    _doc_id_guard(payload, f"pagination for @{username}")
+
     media = payload.get("data", {}).get("xdt_api__v1__feed__user_timeline_graphql_connection")
     if not media:
-        raise ExportError("Instagram did not return authenticated paginated profile media.")
+        raise ExportError(
+            f"Instagram did not return paginated profile media for @{username}. "
+            "The internal GraphQL doc_id may have expired."
+        )
     edges = media.get("edges") or []
     links = []
     for edge in edges:
@@ -1042,6 +924,47 @@ def fetch_authenticated_timeline_page(
     return links, page_info.get("end_cursor"), bool(page_info.get("has_next_page"))
 
 
+def fetch_authenticated_timeline_page(
+    session: requests.Session,
+    username: str,
+    after_cursor: str | None,
+    user_id: str | None = None,
+) -> tuple[list[str], str | None, bool]:
+    """Fetch timeline page — tries GraphQL first, falls back to REST API.
+
+    The REST fallback requires *user_id* (numeric ID of the profile owner).
+    Retries once on transient errors.
+    """
+    for retry in range(2):
+        try:
+            _debug_event("timeline.method", "Trying GraphQL", username=username)
+            return _try_graphql_timeline(session, username, after_cursor)
+        except (ExportError, requests.RequestException) as exc:
+            if retry == 0:
+                logger.warning("GraphQL failed (%s). Retrying once after 3s ...", exc)
+                _safe_sleep(3, jitter=0.3)
+                continue
+            logger.warning("GraphQL failed (%s). Trying REST fallback ...", exc)
+            _debug_event("timeline.fallback", f"GraphQL → REST: {exc}", username=username, user_id=user_id)
+
+    # Fall back to REST if we have user_id
+    if user_id:
+        for retry in range(2):
+            try:
+                _debug_event("timeline.method", "Trying REST", user_id=user_id)
+                return fetch_user_timeline_rest(session, user_id, after_cursor)
+            except requests.RequestException as exc:
+                if retry == 0:
+                    logger.warning("REST timeline failed (%s). Retrying once after 3s ...", exc)
+                    _safe_sleep(3, jitter=0.3)
+                    continue
+                raise
+
+    raise ExportError(
+        f"Could not fetch timeline for @{username}: GraphQL failed and no user_id provided for REST fallback."
+    )
+
+
 def collect_post_links(
     session: requests.Session,
     username: str,
@@ -1050,30 +973,37 @@ def collect_post_links(
     args: argparse.Namespace,
     seed_links: list[str],
     initial_cursor: str | None,
+    user_id: str | None = None,
 ) -> list[str]:
     cache = load_post_links(output_dir, username)
     links = unique_keep_order([*cache["links"], *seed_links])
     if cache["completed"] and len(links) >= total_available > 0:
-        print(f"[resume] Loaded {len(links)} cached post links from {post_links_path(output_dir)}")
+        logger.info("Loaded %s cached post links from %s", len(links), post_links_path(output_dir))
         return links
 
-    # If we have a saved cursor from a previous run, resume from it.
-    # Otherwise use the caller-supplied initial_cursor (first-page result).
+    # Determine starting cursor
     cached_cursor: str | None = cache.get("cursor")
     cursor: str | None = cached_cursor if cached_cursor is not None else initial_cursor
+
+    # If we already have links and nowhere to continue — return as-is.
+    if cursor is None and links:
+        logger.info("No pagination cursor, returning %s cached links", len(links))
+        if total_available and len(links) < total_available:
+            logger.warning("Collected %s of %s links before cursor ran out", len(links), total_available)
+        save_post_links(output_dir, args, links, total_available, completed=bool(total_available and len(links) >= total_available), cursor=None)
+        return links
+
     if cache["links"]:
-        print(f"[resume] Resuming pagination from {len(links)} cached links, cursor={'<saved>' if cached_cursor else '<fresh>'}")
+        logger.info("Resuming pagination from %s cached links, cursor=%s", len(links), "<saved>" if cached_cursor else "<fresh>")
 
     idle_rounds = 0
     MAX_IDLE = 3
 
-    # Continue as long as Instagram gives us a cursor, regardless of has_next_page flag.
-    # Stop only when: cursor exhausted + no new links, OR we reached the declared total.
     while True:
         if total_available and len(links) >= total_available:
             break
 
-        page_links, next_cursor, _has_next = fetch_authenticated_timeline_page(session, username, cursor)
+        page_links, next_cursor, _has_next = fetch_authenticated_timeline_page(session, username, cursor, user_id=user_id)
         before = len(links)
         links = unique_keep_order(links + page_links)
         new_count = len(links) - before
@@ -1082,19 +1012,19 @@ def collect_post_links(
         save_post_links(output_dir, args, links, total_available, completed=False, cursor=cursor)
 
         if new_count:
-            print(f"[fetch] Collected {len(links)}/{total_available or '?'} post links")
+            logger.info("Collected %s/%s post links", len(links), total_available or "?")
             idle_rounds = 0
         else:
             idle_rounds += 1
             if idle_rounds >= MAX_IDLE:
-                print(f"[fetch] No new links after {MAX_IDLE} consecutive pages, stopping pagination")
+                logger.info("No new links after %s consecutive pages, stopping pagination", MAX_IDLE)
                 break
 
         if cursor is None:
             break
 
     if total_available and len(links) < total_available:
-        print(f"[warn] Collected {len(links)} of {total_available} links before pagination stopped")
+        logger.warning("Collected %s of %s links before pagination stopped", len(links), total_available)
     save_post_links(output_dir, args, links, total_available, completed=bool(total_available and len(links) >= total_available), cursor=cursor)
     return links
 
@@ -1173,9 +1103,12 @@ def scrape_post_payload(browser: InstagramBrowser, url: str) -> dict[str, Any]:
 
     page.on("response", handle_response)
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
+        page.goto(url, wait_until="load", timeout=NAVIGATION_TIMEOUT_MS)
         assert_page_is_usable(page, url)
-        page.wait_for_timeout(POST_WAIT_MS)
+        try:
+            page.wait_for_load_state("networkidle", timeout=POST_WAIT_MS)
+        except TimeoutError:
+            pass
         body_text = page.text_content("body") or ""
         if "Please wait a few minutes before you try again" in body_text:
             raise ExportError(f"Instagram rate-limited post page access for {url}. Wait and retry later.")
@@ -1192,26 +1125,29 @@ def scrape_post_payload(browser: InstagramBrowser, url: str) -> dict[str, Any]:
         page.close()
 
 
+def _extract_media_url(item: dict[str, Any]) -> str:
+    candidates = item.get("image_versions2", {}).get("candidates") or []
+    versions = item.get("video_versions") or []
+    if candidates:
+        return candidates[0]["url"]
+    if versions:
+        return versions[0].get("url", "")
+    return ""
+
+
+def _download_single_media(session: requests.Session, media_dir: Path, base_name: str, slide: int, item: dict[str, Any]) -> Path:
+    url = _extract_media_url(item)
+    if not url:
+        raise ExportError(f"Could not find media URL for {base_name} slide {slide}")
+    target = media_dir / f"{base_name}_{slide}" if slide > 0 else media_dir / base_name
+    return download_binary(session, url, target)
+
+
 def build_post_record(session: requests.Session, payload: dict[str, Any], media_dir: Path, index: int, url: str) -> dict[str, Any]:
     shortcode = payload.get("code") or parse_shortcode_from_url(url)
     media_type = payload.get("media_type", 1)
-    media_node = payload
-    if media_type == 8 and payload.get("carousel_media"):
-        media_node = payload["carousel_media"][0]
+    base_name = f"{index:04d}-{safe_slug(shortcode)}"
 
-    image_candidates = media_node.get("image_versions2", {}).get("candidates") or []
-    video_versions = media_node.get("video_versions") or []
-    media_url = image_candidates[0]["url"] if image_candidates else ""
-    if media_type == 2 and image_candidates:
-        media_url = image_candidates[0]["url"]
-    elif media_type == 2 and video_versions:
-        media_url = video_versions[0].get("url", "")
-
-    if not media_url:
-        raise ExportError(f"Could not find media URL for {url}")
-
-    media_target = media_dir / f"{index:04d}-{safe_slug(shortcode)}"
-    local_media = download_binary(session, media_url, media_target)
     caption = ((payload.get("caption") or {}).get("text") or "").strip()
     taken_at = payload.get("taken_at")
     if isinstance(taken_at, int):
@@ -1229,12 +1165,46 @@ def build_post_record(session: requests.Session, payload: dict[str, Any], media_
     kind_label = {1: "Image", 2: "Video", 8: "Carousel"}.get(media_type, "Post")
     likes = payload.get("like_count")
     comments = payload.get("comment_count")
-    alt_text = media_node.get("accessibility_caption") or payload.get("accessibility_caption") or caption[:120] or f"Instagram post {shortcode}"
+
+    # Carousel — download every slide
+    if media_type == 8 and payload.get("carousel_media"):
+        items = payload["carousel_media"]
+        media_paths: list[str] = []
+        first_alt = ""
+        for slide_idx, item in enumerate(items):
+            media_file = _download_single_media(session, media_dir, base_name, slide_idx, item)
+            rel = f"media/{media_file.name}"
+            media_paths.append(rel)
+            if slide_idx == 0:
+                first_alt = item.get("accessibility_caption") or ""
+        alt_text = first_alt or caption[:120] or f"Instagram post {shortcode}"
+        return {
+            "shortcode": shortcode,
+            "caption": caption,
+            "local_media_path": media_paths[0],
+            "media_paths": media_paths,
+            "instagram_url": normalized_post_url(url),
+            "date_label": date_value.strftime("%d.%m.%Y %H:%M"),
+            "likes_label": f"Likes: {format_count(likes if isinstance(likes, int) else 0)}",
+            "comments_label": f"Comments: {format_count(comments if isinstance(comments, int) else 0)}",
+            "kind_label": kind_label,
+            "alt_text": alt_text,
+        }
+
+    # Single image / video
+    item = payload
+    url_from_item = _extract_media_url(item)
+    if not url_from_item:
+        raise ExportError(f"Could not find media URL for {url}")
+
+    media_file = download_binary(session, url_from_item, media_dir / base_name)
+    alt_text = item.get("accessibility_caption") or payload.get("accessibility_caption") or caption[:120] or f"Instagram post {shortcode}"
 
     return {
         "shortcode": shortcode,
         "caption": caption,
-        "local_media_path": f"media/{local_media.name}",
+        "local_media_path": f"media/{media_file.name}",
+        "media_paths": [f"media/{media_file.name}"],
         "instagram_url": normalized_post_url(url),
         "date_label": date_value.strftime("%d.%m.%Y %H:%M"),
         "likes_label": f"Likes: {format_count(likes if isinstance(likes, int) else 0)}",
@@ -1285,15 +1255,18 @@ def generate_html(
     )
     index_file = output_dir / "index.html"
     index_file.write_text(html, encoding="utf-8")
-    print(f"[done] HTML saved to {index_file}")
+    logger.info("HTML saved to %s", index_file)
 
 
 def select_post_links(all_links: list[str], args: argparse.Namespace) -> list[str]:
     if args.mode == "all":
         return all_links
-    if args.limit <= 0:
-        raise ExportError("--limit must be greater than 0")
-    return list(reversed(all_links[-args.limit:]))
+    limit = getattr(args, "limit", 0)
+    if limit <= 0:
+        return all_links
+    if args.mode == "comments":
+        return all_links[:limit]
+    return list(reversed(all_links[-limit:]))
 
 
 def run(args: argparse.Namespace) -> int:
@@ -1306,15 +1279,15 @@ def run(args: argparse.Namespace) -> int:
         session = browser.authenticated_session()
         public_session = public_api_session()
 
-        profile, _initial_links, _public_cursor, _user_id = fetch_profile_info(public_session, args.username)
-        print(f"[fetch] Resolved @{profile['username']} profile metadata")
+        profile, _, _, user_id = fetch_profile_info(public_session, args.username)
+        logger.info("Resolved @%s profile metadata", profile["username"])
 
-        # Only fetch the first page if we have no cached links yet — otherwise
-        # collect_post_links will resume from the saved cursor directly.
+        # Try to resume from saved cursor; if missing, fetch first page fresh.
         cached = load_post_links(output_dir, profile["username"])
-        if cached["links"]:
+        saved_cursor = cached.get("cursor")
+        if cached["links"] and saved_cursor is not None:
             initial_links: list[str] = []
-            end_cursor: str | None = None  # ignored; collect_post_links uses saved cursor
+            end_cursor: str | None = None
         else:
             initial_links, end_cursor, _has_next = fetch_authenticated_timeline_page(session, profile["username"], None)
 
@@ -1326,10 +1299,15 @@ def run(args: argparse.Namespace) -> int:
             args=args,
             seed_links=initial_links,
             initial_cursor=end_cursor,
+            user_id=user_id,
         )
-        print(f"[fetch] Collected {len(all_links)} post URLs")
+        logger.info("Collected %s post URLs", len(all_links))
 
         selected_links = select_post_links(all_links, args)
+        if args.dry_run:
+            logger.info("Dry-run: %s/%s posts selected for export", len(selected_links), len(all_links))
+            return 0
+
         state = load_export_state(output_dir, args)
         existing_records = state.get("post_records", []) if isinstance(state.get("post_records"), list) else []
         records_by_shortcode = {
@@ -1346,23 +1324,63 @@ def run(args: argparse.Namespace) -> int:
             avatar_file = download_binary(session, avatar_url, output_dir / "avatar")
             avatar_name = avatar_file.name
 
+        # Separate cached and new posts
         post_records: list[dict[str, Any]] = []
+        need_scrape: list[tuple[int, str, str]] = []
         for index, post_url in enumerate(selected_links, start=1):
             shortcode = parse_shortcode_from_url(post_url)
             existing_record = records_by_shortcode.get(shortcode)
             if existing_record:
                 media_path = existing_record.get("local_media_path")
-                if isinstance(media_path, str) and (output_dir / media_path).exists():
-                    print(f"[resume] {index}/{len(selected_links)} {shortcode} already downloaded")
+                media_paths = existing_record.get("media_paths") or [media_path] if media_path else []
+                all_exist = all(
+                    isinstance(p, str) and (output_dir / p).exists()
+                    for p in media_paths
+                )
+                if media_paths and all_exist:
+                    logger.info("%s/%s %s already cached", index, len(selected_links), shortcode)
                     post_records.append(existing_record)
                     continue
+            need_scrape.append((index, post_url, shortcode))
 
-            print(f"[download] {index}/{len(selected_links)} {shortcode}")
+        # Scrape post payloads sequentially (requires browser context)
+        scraped: list[tuple[int, str, str, dict[str, Any]]] = []
+        for index, post_url, shortcode in need_scrape:
+            logger.info("Scraping %s/%s %s", index, len(selected_links), shortcode)
             payload = scrape_post_payload(browser, post_url)
-            record = build_post_record(session, payload, output_dir / "media", index, post_url)
-            post_records.append(record)
-            save_export_state(output_dir, args, profile, avatar_name, post_records, completed=False)
+            scraped.append((index, post_url, shortcode, payload))
 
+        # Download media in parallel
+        if scraped:
+            logger.info("Downloading %s media items ...", len(scraped))
+            errors: list[str] = []
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                fut_map: dict[Any, tuple[int, str]] = {}
+                for index, post_url, shortcode, payload in scraped:
+                    fut = pool.submit(build_post_record, session, payload, output_dir / "media", index, post_url)
+                    fut_map[fut] = (index, shortcode)
+
+                results: dict[int, dict[str, Any]] = {}
+                for fut in as_completed(fut_map):
+                    idx, shortcode = fut_map[fut]
+                    try:
+                        results[idx] = fut.result()
+                    except ExportError as exc:
+                        logger.error("Skipping %s: %s", shortcode, exc)
+                        errors.append(shortcode)
+
+            if results:
+                post_records.extend(results[i] for i in sorted(results))
+                save_export_state(output_dir, args, profile, avatar_name, post_records, completed=False)
+            if errors:
+                logger.warning("%s post(s) failed and were skipped: %s", len(errors), ", ".join(errors))
+
+        records_by_shortcode = {record["shortcode"]: record for record in post_records}
+        post_records = [
+            records_by_shortcode[code]
+            for url in selected_links
+            if (code := parse_shortcode_from_url(url)) in records_by_shortcode
+        ]
         generate_html(
             profile=profile,
             post_records=post_records,
@@ -1371,24 +1389,624 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
             batch_size=max(1, args.batch_size),
         )
-        save_export_state(output_dir, args, profile, avatar_name, post_records, completed=True)
-        print(f"[open] file://{output_dir / 'index.html'}")
+        save_export_state(output_dir, args, profile, avatar_name, post_records, completed=len(post_records) == len(selected_links))
+        print(f"file://{output_dir / 'index.html'}")
         return 0
 
 
 def main() -> int:
     args = parse_args()
+    if args.verbose:
+        level = logging.DEBUG
+    elif args.quiet:
+        level = logging.WARNING
+    else:
+        level = logging.INFO
+    logging.basicConfig(
+        format="%(levelname)s %(message)s",
+        level=level,
+        stream=sys.stderr,
+    )
     try:
+        if args.mode == "comments":
+            return run_comments(args)
         return run(args)
     except KeyboardInterrupt:
-        print("\n[abort] Interrupted by user", file=sys.stderr)
+        logger.error("Interrupted by user")
+        _debug_event("fatal", "KeyboardInterrupt")
+        _try_save_debug_log(args)
         return 130
     except ExportError as exc:
-        print(f"[error] {exc}", file=sys.stderr)
+        logger.error("%s", exc)
+        _debug_event("fatal", f"ExportError: {exc}", exc=str(exc))
+        _try_save_debug_log(args)
         return 2
     except requests.RequestException as exc:
-        print(f"[error] Network request failed: {exc}", file=sys.stderr)
+        logger.error("Network request failed: %s", exc)
+        _debug_event("fatal", f"Network error: {exc}",
+                     exc=str(exc), url=getattr(exc.response, "url", None) if hasattr(exc, "response") else None,
+                     status=getattr(exc.response, "status_code", None) if hasattr(exc, "response") else None)
+        _try_save_debug_log(args)
         return 3
+
+
+def _try_save_debug_log(args: argparse.Namespace) -> None:
+    """Try to save debug log; fails silently if output_dir isn't available."""
+    out = getattr(args, "output_dir", None)
+    if out:
+        _save_debug_log(Path(out))
+    elif getattr(args, "username", None):
+        fallback = Path("exports") / f"{args.username}-debug"
+        fallback.mkdir(parents=True, exist_ok=True)
+        _save_debug_log(fallback)
+
+
+# ── Comment Export ──────────────────────────────────────────────────────────
+
+SHORTCODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+
+def shortcode_to_media_id(shortcode: str) -> str:
+    decoded = 0
+    for c in shortcode:
+        decoded = decoded * 64 + SHORTCODE_ALPHABET.index(c)
+    return str(decoded)
+
+
+def _safe_sleep(base: float, jitter: float = 0.3) -> None:
+    delay = random.uniform(base * (1 - jitter), base * (1 + jitter))
+    time.sleep(delay)
+
+
+COMMENTS_HEADERS = {
+    **IG_API_HEADERS,
+    "User-Agent": IG_MOBILE_USER_AGENT,
+}
+
+
+def fetch_comments_page(
+    session: requests.Session,
+    media_id: str,
+    max_id: str | None,
+    delay: float,
+) -> tuple[list[dict[str, Any]], str | None, bool]:
+    _safe_sleep(delay, jitter=0.3)
+
+    params: dict[str, Any] = {"count": 50}
+    if max_id:
+        params["max_id"] = max_id
+
+    response = session.get(
+        f"{IG_BASE_URL}/api/v1/media/{media_id}/comments/",
+        params=params,
+        headers=COMMENTS_HEADERS,
+        timeout=30,
+        allow_redirects=False,
+    )
+
+    if response.status_code in (302, 303, 307, 401):
+        raise ExportError(
+            "Instagram redirected to login — your sessionid is expired or invalid. "
+            "Get a fresh one from your browser (F12 → Application → Cookies → sessionid) "
+            "and pass it via --sessionid"
+        )
+
+    if response.status_code == 429:
+        wait = 60
+        logger.warning("Rate limited (429) on comments. Waiting %ss ...", wait)
+        _safe_sleep(wait, jitter=0.1)
+        response = session.get(
+            f"{IG_BASE_URL}/api/v1/media/{media_id}/comments/",
+            params=params,
+            headers=COMMENTS_HEADERS,
+            timeout=30,
+            allow_redirects=False,
+        )
+        if response.status_code in (302, 303, 307, 401):
+            raise ExportError("Session expired or invalid (redirected to login after rate limit).")
+        if response.status_code == 429:
+            raise ExportError("Rate limited twice consecutively on comments. Aborting to protect your account.")
+
+    response.raise_for_status()
+    data = response.json()
+
+    comments = data.get("comments", [])
+    next_max_id = data.get("next_max_id")
+    has_more = data.get("has_more_comments", False)
+    return comments, next_max_id, has_more
+
+
+def fetch_all_comments(
+    session: requests.Session,
+    shortcode: str,
+    delay: float,
+) -> list[dict[str, Any]]:
+    media_id = shortcode_to_media_id(shortcode)
+    all_comments: list[dict[str, Any]] = []
+    max_id: str | None = None
+
+    while True:
+        comments, next_max_id, has_more = fetch_comments_page(session, media_id, max_id, delay)
+        all_comments.extend(comments)
+        if not has_more or not next_max_id:
+            break
+        max_id = next_max_id
+
+    return all_comments
+
+
+def build_comment_record(comment: dict[str, Any], shortcode: str) -> dict[str, Any]:
+    user = comment.get("user") or {}
+    return {
+        "comment_id": str(comment.get("pk", comment.get("id", ""))),
+        "post_shortcode": shortcode,
+        "username": user.get("username", "unknown"),
+        "full_name": user.get("full_name", ""),
+        "profile_pic_url": user.get("profile_pic_url", ""),
+        "text": comment.get("text", ""),
+        "created_at": comment.get("created_at", 0),
+        "like_count": comment.get("like_count", 0),
+        "child_comment_count": comment.get("child_comment_count", 0),
+    }
+
+
+def aggregate_comment_stats(
+    comment_records: list[dict[str, Any]],
+    post_count: int,
+) -> dict[str, Any]:
+    total = len(comment_records)
+    usernames = [c["username"] for c in comment_records]
+    unique = len(set(usernames))
+
+    # Per-user stats
+    user_stats: dict[str, dict[str, Any]] = {}
+    for c in comment_records:
+        u = c["username"]
+        if u not in user_stats:
+            user_stats[u] = {
+                "username": u,
+                "full_name": c["full_name"],
+                "profile_pic_url": c["profile_pic_url"],
+                "count": 0,
+                "likes_received": 0,
+                "last_comment_ts": 0,
+                "posts_commented": set(),
+            }
+        s = user_stats[u]
+        s["count"] += 1
+        s["likes_received"] += c.get("like_count", 0)
+        s["posts_commented"].add(c["post_shortcode"])
+        ts = c.get("created_at", 0)
+        if ts > s["last_comment_ts"]:
+            s["last_comment_ts"] = ts
+
+    for s in user_stats.values():
+        s["posts_commented"] = len(s["posts_commented"])
+
+    top_commenters = sorted(user_stats.values(), key=lambda x: -x["count"])[:30]
+
+    # Top commented posts
+    post_counts: dict[str, int] = {}
+    for c in comment_records:
+        sc = c["post_shortcode"]
+        post_counts[sc] = post_counts.get(sc, 0) + 1
+    top_posts = sorted(post_counts.items(), key=lambda x: -x[1])[:20]
+
+    return {
+        "total_comments": total,
+        "unique_commenters": unique,
+        "posts_with_comments": len(post_counts),
+        "total_posts": post_count,
+        "avg_per_post": round(total / max(post_count, 1), 1),
+        "top_commenters": top_commenters,
+        "top_posts": [{"shortcode": sc, "count": n} for sc, n in top_posts],
+    }
+
+
+COMMENTS_HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+  :root {{ --bg:#fafafa; --surface:#fff; --text:#111; --muted:#6b7280; --line:rgba(17,17,17,.08); --accent:#ff4f8b; }}
+  * {{ box-sizing:border-box; }}
+  body {{ margin:0; font-family:system-ui,sans-serif; color:var(--text); background:var(--bg); }}
+  .wrap {{ max-width:900px; margin:0 auto; padding:24px 16px 48px; }}
+  h1 {{ font-size:1.4rem; }}
+  .stat-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:12px; margin:20px 0; }}
+  .stat-card {{ border:1px solid var(--line); border-radius:14px; padding:16px; text-align:center; background:var(--surface); }}
+  .stat-card .num {{ font-size:1.6rem; font-weight:700; color:var(--accent); }}
+  .stat-card .label {{ font-size:.85rem; color:var(--muted); margin-top:4px; }}
+  .section {{ margin-top:28px; }}
+  .section h2 {{ font-size:1.15rem; margin-bottom:12px; }}
+  table {{ width:100%; border-collapse:collapse; font-size:.9rem; }}
+  th,td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); }}
+  th {{ color:var(--muted); font-weight:600; font-size:.8rem; text-transform:uppercase; }}
+  .rank {{ color:var(--muted); width:28px; }}
+  .user-cell {{ display:flex; align-items:center; gap:8px; }}
+  .user-cell img {{ width:28px; height:28px; border-radius:50%; background:#ececec; }}
+  .truncate {{ max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+  .pill {{ display:inline-block; padding:2px 10px; border-radius:999px; background:rgba(255,79,139,.1); color:var(--accent); font-size:.8rem; font-weight:600; }}
+  .user-link {{ color:inherit; text-decoration:none; }}
+  .user-link:hover {{ text-decoration:underline; }}
+  .post-link {{ color:var(--accent); text-decoration:none; font-weight:500; }}
+  .post-link:hover {{ text-decoration:underline; }}
+  @media(prefers-color-scheme:dark) {{ :root {{ --bg:#121212; --surface:#1e1e1e; --text:#e4e4e4; --muted:#9ca3af; --line:rgba(255,255,255,.08); }} }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>💬 Comments Export — @{username}</h1>
+  <p style="color:var(--muted);font-size:.9rem">{export_date}</p>
+
+  <div class="stat-grid" id="stats"></div>
+
+  <div class="section" id="top-commenters-section">
+    <h2>🏆 Top commenters</h2>
+    <div id="top-commenters"></div>
+  </div>
+
+  <div class="section" id="top-posts-section">
+    <h2>📌 Most commented posts</h2>
+    <div id="top-posts"></div>
+  </div>
+</div>
+
+<script id="comment-data" type="application/json">{comment_json}</script>
+<script>
+const data = JSON.parse(document.getElementById('comment-data').textContent);
+const s = data.stats;
+
+// Stat cards
+document.getElementById('stats').innerHTML = `
+  <div class="stat-card"><div class="num">${{ s.total_comments }}</div><div class="label">Comments</div></div>
+  <div class="stat-card"><div class="num">${{ s.unique_commenters }}</div><div class="label">Unique commenters</div></div>
+  <div class="stat-card"><div class="num">${{ s.posts_with_comments }}/${{ s.total_posts }}</div><div class="label">Posts with comments</div></div>
+  <div class="stat-card"><div class="num">${{ s.avg_per_post }}</div><div class="label">Avg per post</div></div>
+`;
+
+const esc = v => String(v).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+
+const renderUser = u => `<div class="user-cell"><img src="${{ esc(u.profile_pic_url) }}" alt=""><a class="user-link" href="https://www.instagram.com/${{ esc(u.username) }}/" target="_blank">${{ esc(u.username) }}</a></div>`;
+
+// Top commenters
+document.getElementById('top-commenters').innerHTML = `<table>
+  <tr><th>#</th><th>User</th><th>Comments</th><th>Posts</th></tr>
+  ${{ s.top_commenters.map((u,i) => `<tr><td class="rank">${{ i+1 }}</td><td>${{ renderUser(u) }}</td><td><span class="pill">${{ u.count }}</span></td><td>${{ u.posts_commented }}</td></tr>`).join('') }}
+</table>`;
+
+// Top posts
+document.getElementById('top-posts').innerHTML = `<table>
+  <tr><th>#</th><th>Post</th><th>Comments</th></tr>
+  ${{ s.top_posts.map((p,i) => `<tr><td class="rank">${{ i+1 }}</td><td><a class="post-link" href="https://www.instagram.com/p/${{ esc(p.shortcode) }}/" target="_blank">${{ esc(p.shortcode) }}</a></td><td><span class="pill">${{ p.count }}</span></td></tr>`).join('') }}
+</table>`;
+</script>
+</body>
+</html>
+"""
+
+
+CONFIG_DIR = Path.home() / ".insta-export"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+
+def _load_config() -> dict[str, Any]:
+    if CONFIG_FILE.exists():
+        try:
+            return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pass
+    return {}
+
+
+def _save_config(config: dict[str, Any]) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _session_from_sessionid(sessionid: str) -> requests.Session:
+    """Build an authenticated requests.Session from a raw sessionid cookie value."""
+    session = _make_session()
+    session.cookies.set("sessionid", sessionid, domain=".instagram.com", path="/")
+
+    user_id = sessionid.split("%")[0] if "%" in sessionid else ""
+    if user_id:
+        session.cookies.set("ds_user_id", user_id, domain=".instagram.com", path="/")
+
+    csrf = _fetch_csrftoken(session)
+    if csrf:
+        session.headers["X-CSRFToken"] = csrf
+        _debug_event("auth.csrf", "csrftoken obtained", source="sessionid")
+    else:
+        logger.warning("Could not obtain csrftoken; GraphQL queries may fail, REST fallback will be used.")
+        _debug_event("auth.csrf", "csrftoken MISSING", source="sessionid")
+
+    # Validate session
+    if not _session_is_valid(session):
+        raise ExportError(
+            "The sessionid you provided is expired or invalid. "
+            "Get a fresh one: open Instagram in your browser, press F12 → Application → Cookies → "
+            "instagram.com → sessionid, copy the value, and pass it with --sessionid"
+        )
+
+    _patch_session_for_logging(session)
+    _debug_event("auth.source", "Session from sessionid")
+    return session
+
+
+def _session_is_valid(session: requests.Session) -> bool:
+    """Check if the session is actually authenticated by hitting a protected endpoint."""
+    try:
+        resp = session.get(
+            "https://www.instagram.com/api/v1/accounts/current_user/",
+            timeout=15,
+            allow_redirects=False,
+        )
+        if resp.status_code in (302, 303, 307, 401):
+            _debug_event("session.invalid", f"Redirect/auth required, status={resp.status_code}")
+            return False
+        if resp.status_code == 200:
+            return True
+        # Some other status — try a second lightweight check
+        resp2 = session.get(
+            f"{IG_BASE_URL}/api/v1/si/fetch_headers/",
+            params={"client_version": "1"},
+            timeout=10,
+            allow_redirects=False,
+        )
+        if resp2.status_code in (302, 303, 307):
+            _debug_event("session.invalid", "fetch_headers redirected")
+            return False
+        return True
+    except requests.RequestException as exc:
+        _debug_event("session.check_error", f"Session check failed: {exc}")
+        # If the check itself fails, assume session might still be valid
+        return True
+
+
+def _fetch_csrftoken(session: requests.Session) -> str | None:
+    """Try to obtain a fresh csrftoken via multiple methods."""
+    # Method 1: lightweight fetch_headers endpoint
+    for _attempt in range(2):
+        try:
+            resp = session.get(
+                f"{IG_BASE_URL}/api/v1/si/fetch_headers/",
+                params={"client_version": "1"},
+                timeout=15,
+            )
+            if resp.status_code == 429:
+                _safe_sleep(5, jitter=0.2)
+                continue
+            csrf = session.cookies.get("csrftoken")
+            if csrf:
+                return csrf
+            break
+        except requests.RequestException:
+            _safe_sleep(2)
+            continue
+
+    # Method 2: scrape from the main page
+    try:
+        resp = session.get(f"{IG_BASE_URL}/", timeout=20)
+        if resp.status_code != 429:
+            csrf = session.cookies.get("csrftoken")
+            if csrf:
+                return csrf
+    except requests.RequestException:
+        pass
+
+    return None
+
+
+def run_comments(args: argparse.Namespace) -> int:
+    output_dir = ensure_output_dir(args.output_dir, args)
+    profile_dir = Path(args.browser_profile_dir).expanduser().resolve()
+
+    session: requests.Session | None = None
+    profile = None
+
+    # 1. Try --sessionid flag (explicit)
+    if args.sessionid:
+        try:
+            session = _session_from_sessionid(args.sessionid)
+            _save_config({**{"sessionid": args.sessionid}})
+            logger.info("Sessionid saved to %s", CONFIG_FILE)
+        except ExportError as exc:
+            logger.warning("Provided --sessionid is invalid: %s", exc)
+
+    # 2. Try saved config
+    if session is None:
+        config = _load_config()
+        saved = config.get("sessionid")
+        if saved:
+            try:
+                session = _session_from_sessionid(saved)
+                logger.debug("Using saved sessionid from %s", CONFIG_FILE)
+            except ExportError as exc:
+                logger.warning("Saved sessionid expired: %s", exc)
+                # Clear invalid sessionid so user is prompted for a fresh one
+                _save_config({})
+
+    # 3. Try Playwright browser profile
+    if session is None and profile_dir.exists():
+        try:
+            with InstagramBrowser(profile_dir=profile_dir, headful=False) as browser:
+                if browser.is_logged_in():
+                    session = browser.authenticated_session()
+        except Exception as exc:
+            logger.debug("Playwright failed: %s", exc)
+
+    # 4. Prompt user interactively
+    while session is None:
+        logger.warning("No Instagram session found. Paste your sessionid cookie (F12 → Application → Cookies → sessionid):")
+        try:
+            raw = input("sessionid: ").strip()
+            if not raw:
+                logger.error("No sessionid provided.")
+                _save_debug_log(output_dir)
+                return 1
+            try:
+                session = _session_from_sessionid(raw)
+                _save_config({"sessionid": raw})
+                logger.info("Sessionid saved to %s", CONFIG_FILE)
+            except ExportError as exc:
+                logger.warning("Invalid sessionid: %s. Try again.", exc)
+                continue
+        except (EOFError, KeyboardInterrupt):
+            logger.error("Aborted.")
+            _save_debug_log(output_dir)
+            return 1
+
+    # Fetch profile metadata (non-fatal — comments can proceed without it)
+    profile, initial_links, end_cursor, user_id = None, [], None, None
+    try:
+        fetched_profile, fetched_links, fetched_cursor, fetched_uid = fetch_profile_info(public_api_session(), args.username)
+        profile = fetched_profile
+        initial_links = fetched_links
+        end_cursor = fetched_cursor
+        user_id = fetched_uid
+        logger.info("Resolved @%s", profile["username"])
+    except (ExportError, requests.RequestException) as exc:
+        logger.warning("Could not resolve profile via API: %s", exc)
+        # Fallback: HTML scrape + search API
+        try:
+            scraped_profile, scraped_links, _, scraped_uid = _scrape_profile_html(args.username)
+            profile = scraped_profile or profile
+            initial_links = scraped_links or initial_links
+            user_id = user_id or scraped_uid
+        except (ExportError, requests.RequestException) as inner:
+            logger.debug("HTML scrape also failed: %s", inner)
+        if not user_id:
+            user_id = _resolve_user_id_via_search(args.username) or user_id
+
+    # Collect all post links
+    username = profile["username"] if profile else args.username
+    cached = load_post_links(output_dir, username)
+    saved_cursor = cached.get("cursor")
+    if cached["links"] and saved_cursor is not None:
+        initial_links = []
+        end_cursor = None
+    elif not initial_links:
+        _debug_event("timeline.initial", "Fetching first page of posts")
+        initial_links, end_cursor, _ = fetch_authenticated_timeline_page(session, username, None, user_id=user_id or None)
+
+    mediacount = profile.get("mediacount") if profile else 0
+    all_links = collect_post_links(
+        session=session,
+        username=username,
+        total_available=int(mediacount or len(initial_links)),
+        output_dir=output_dir,
+        args=args,
+        seed_links=initial_links,
+        initial_cursor=end_cursor,
+        user_id=user_id or None,
+    )
+    logger.info("Collected %s post URLs", len(all_links))
+    selected_links = select_post_links(all_links, args)
+
+    if args.dry_run:
+        logger.info("Dry-run: %s/%s posts selected for comments export", len(selected_links), len(all_links))
+        _save_debug_log(output_dir)
+        return 0
+
+    delay = getattr(args, "comment_delay", 2.0)
+
+    # Load existing comment cache
+    comments_file = output_dir / ".comments.json"
+    if comments_file.exists():
+        try:
+            existing = json.loads(comments_file.read_text(encoding="utf-8"))
+            existing_comments: list[dict] = existing.get("comments", [])
+            existing_shortcodes: set[str] = {c["post_shortcode"] for c in existing_comments if "post_shortcode" in c}
+        except (OSError, json.JSONDecodeError):
+            existing_comments = []
+            existing_shortcodes = set()
+    else:
+        existing_comments = []
+        existing_shortcodes = set()
+
+    if existing_shortcodes:
+        logger.info("Resuming with %s cached comments from %s posts", len(existing_comments), len(existing_shortcodes))
+
+    all_comment_records: list[dict[str, Any]] = list(existing_comments)
+    post_links_to_process = [
+        (i, url)
+        for i, url in enumerate(selected_links, start=1)
+        if parse_shortcode_from_url(url) not in existing_shortcodes
+    ]
+
+    if not post_links_to_process:
+        logger.info("All posts already have comments cached")
+    else:
+        logger.info("Fetching comments for %s posts (delay=%ss) ...", len(post_links_to_process), delay)
+
+    for index, post_url in post_links_to_process:
+        shortcode = parse_shortcode_from_url(post_url)
+        logger.info("Comments %s/%s %s", index, len(selected_links), shortcode)
+
+        try:
+            raw_comments = fetch_all_comments(session, shortcode, delay)
+        except ExportError as exc:
+            logger.error("Skipping %s: %s", shortcode, exc)
+            continue
+
+        records = [build_comment_record(c, shortcode) for c in raw_comments]
+        all_comment_records.extend(records)
+        logger.info("  → %s comments", len(records))
+
+        # Save incrementally
+        comments_file.write_text(
+            json.dumps({"comments": all_comment_records, "updated_at": datetime.now(UTC).isoformat()}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    logger.info("Total comments collected: %s", len(all_comment_records))
+    _debug_event("comments.done", f"Total comments: {len(all_comment_records)}", count=len(all_comment_records))
+
+    if not all_comment_records:
+        logger.warning("No comments found for any post")
+        _save_debug_log(output_dir)
+        return 0
+
+    stats = aggregate_comment_stats(all_comment_records, len(selected_links))
+    raw_json = json.dumps({"stats": stats}, ensure_ascii=False).replace("</", "<\\/")
+    display_username = profile["username"] if profile else args.username
+    html = COMMENTS_HTML_TEMPLATE.format(
+        title=escape(f"Comments Export — @{display_username}"),
+        username=escape(display_username),
+        export_date=escape(datetime.now().strftime("%d.%m.%Y %H:%M")),
+        comment_json=raw_json,
+    )
+    comments_html = output_dir / "comments.html"
+    comments_html.write_text(html, encoding="utf-8")
+    logger.info("Comments saved to %s", comments_html)
+
+    # Also save CSV
+    try:
+        _save_comments_csv(all_comment_records, output_dir)
+    except Exception as exc:
+        logger.warning("Could not save CSV: %s", exc)
+
+    print(f"file://{comments_html}")
+    _save_debug_log(output_dir)
+    return 0
+
+
+def _save_comments_csv(records: list[dict[str, Any]], output_dir: Path) -> None:
+    path = output_dir / "comments.csv"
+    fieldnames = [
+        "post_shortcode", "username", "full_name", "text",
+        "created_at", "like_count", "child_comment_count", "comment_id",
+    ]
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for rec in records:
+            row = {k: rec.get(k, "") for k in fieldnames}
+            writer.writerow(row)
+    logger.info("CSV saved to %s (UTF-8 BOM)", path)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,689 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>
+    :root {{
+      --bg: #fafafa;
+      --surface: rgba(255, 255, 255, 0.92);
+      --surface-strong: #ffffff;
+      --text: #111111;
+      --muted: #6b7280;
+      --line: rgba(17, 17, 17, 0.08);
+      --shadow: 0 24px 60px rgba(17, 24, 39, 0.08);
+      --accent: #ff4f8b;
+      --accent-2: #ff8a00;
+      --radius: 26px;
+      --feed-width: 540px;
+    }}
+
+    * {{
+      box-sizing: border-box;
+    }}
+
+    body {{
+      margin: 0;
+      color: var(--text);
+      font-family: "Avenir Next", "Helvetica Neue", Helvetica, Arial, sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(255, 79, 139, 0.10), transparent 32%),
+        radial-gradient(circle at top right, rgba(255, 138, 0, 0.10), transparent 24%),
+        linear-gradient(180deg, #fefefe 0%, #f8f8f8 50%, #f5f5f5 100%);
+    }}
+
+    a {{
+      color: inherit;
+    }}
+
+    .topbar {{
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      backdrop-filter: blur(14px);
+      background: rgba(255, 255, 255, 0.86);
+      border-bottom: 1px solid var(--line);
+    }}
+
+    .topbar-inner {{
+      max-width: 1080px;
+      margin: 0 auto;
+      padding: 18px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }}
+
+    .brand {{
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      min-width: 0;
+    }}
+
+    .brand-mark {{
+      width: 38px;
+      height: 38px;
+      border-radius: 12px;
+      background: linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%);
+      box-shadow: 0 10px 24px rgba(255, 79, 139, 0.28);
+      position: relative;
+      flex: 0 0 auto;
+    }}
+
+    .brand-mark::before {{
+      content: "";
+      position: absolute;
+      inset: 8px;
+      border: 2px solid rgba(255, 255, 255, 0.95);
+      border-radius: 10px;
+    }}
+
+    .brand-mark::after {{
+      content: "";
+      position: absolute;
+      width: 7px;
+      height: 7px;
+      right: 8px;
+      top: 8px;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.95);
+    }}
+
+    .brand-copy {{
+      min-width: 0;
+    }}
+
+    .brand-title {{
+      font-size: 1.15rem;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }}
+
+    .brand-meta {{
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }}
+
+    .stats-pill {{
+      flex: 0 0 auto;
+      padding: 10px 14px;
+      border-radius: 999px;
+      background: rgba(17, 17, 17, 0.04);
+      font-size: 0.92rem;
+      color: var(--muted);
+      white-space: nowrap;
+    }}
+
+    .page {{
+      max-width: 1080px;
+      margin: 0 auto;
+      padding: 32px 24px 56px;
+    }}
+
+    .profile-card {{
+      display: grid;
+      grid-template-columns: 112px minmax(0, 1fr);
+      gap: 24px;
+      padding: 28px;
+      border: 1px solid var(--line);
+      border-radius: 32px;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      margin-bottom: 28px;
+    }}
+
+    .avatar-wrap {{
+      width: 112px;
+      height: 112px;
+      padding: 4px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%);
+    }}
+
+    .avatar {{
+      display: block;
+      width: 100%;
+      height: 100%;
+      border-radius: 50%;
+      object-fit: cover;
+      background: #ececec;
+      border: 4px solid white;
+    }}
+
+    .profile-head {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 12px 16px;
+      margin-bottom: 14px;
+    }}
+
+    .username {{
+      font-size: clamp(1.4rem, 1.6vw, 1.7rem);
+      font-weight: 700;
+      letter-spacing: -0.04em;
+    }}
+
+    .realname {{
+      color: var(--muted);
+      font-size: 1rem;
+    }}
+
+    .meta-grid {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px 20px;
+      margin-bottom: 14px;
+      font-size: 0.95rem;
+    }}
+
+    .meta-grid strong {{
+      color: var(--text);
+    }}
+
+    .bio {{
+      white-space: pre-wrap;
+      line-height: 1.5;
+      color: #232323;
+    }}
+
+    .feed-shell {{
+      display: flex;
+      justify-content: center;
+    }}
+
+    .feed-column {{
+      width: min(100%, var(--feed-width));
+    }}
+
+    .post-card {{
+      margin-bottom: 22px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      overflow: hidden;
+      background: var(--surface-strong);
+      box-shadow: 0 20px 48px rgba(17, 24, 39, 0.08);
+      transform: translateY(18px);
+      opacity: 0;
+      animation: slide-in 360ms ease forwards;
+    }}
+
+    .post-head {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 16px 18px;
+    }}
+
+    .post-head .avatar {{
+      width: 40px;
+      height: 40px;
+      border: 0;
+    }}
+
+    .post-owner {{
+      flex: 1 1 auto;
+      min-width: 0;
+    }}
+
+    .post-owner strong,
+    .post-owner span {{
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+
+    .post-owner span {{
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 0.88rem;
+    }}
+
+    .post-link {{
+      flex: 0 0 auto;
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 0.9rem;
+    }}
+
+    .post-media {{
+      display: block;
+      width: 100%;
+      height: auto;
+      object-fit: contain;
+      background: #efefef;
+    }}
+
+    /* Carousel / multi-image posts */
+    .carousel {{
+      display: flex;
+      gap: 4px;
+      overflow-x: auto;
+      scroll-snap-type: x mandatory;
+      scrollbar-width: thin;
+    }}
+
+    .carousel .post-media {{
+      scroll-snap-align: start;
+      flex: 0 0 100%;
+    }}
+
+    .carousel-dots {{
+      display: flex;
+      justify-content: center;
+      gap: 6px;
+      padding: 8px 0;
+    }}
+
+    .carousel-dot {{
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--line);
+      flex: 0 0 auto;
+    }}
+
+    .carousel-dot.active {{
+      background: var(--accent);
+    }}
+
+    .post-body {{
+      padding: 16px 18px 20px;
+    }}
+
+    .post-stats {{
+      display: flex;
+      gap: 14px;
+      flex-wrap: wrap;
+      margin-bottom: 10px;
+      font-size: 0.93rem;
+    }}
+
+    .post-stats span {{
+      padding: 8px 10px;
+      border-radius: 999px;
+      background: rgba(17, 17, 17, 0.04);
+    }}
+
+    .caption {{
+      white-space: pre-wrap;
+      line-height: 1.55;
+      overflow-wrap: anywhere;
+    }}
+
+    .caption-empty {{
+      color: var(--muted);
+      font-style: italic;
+    }}
+
+    .render-progress {{
+      text-align: center;
+      color: var(--muted);
+      font-size: 0.93rem;
+      margin: 12px 0 6px;
+    }}
+
+    .loader {{
+      width: 100%;
+      display: flex;
+      justify-content: center;
+      padding: 14px 0 0;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }}
+
+    .loader.hidden {{
+      display: none;
+    }}
+
+    .empty-state {{
+      text-align: center;
+      padding: 44px 24px;
+      border: 1px dashed var(--line);
+      border-radius: var(--radius);
+      background: rgba(255, 255, 255, 0.8);
+      color: var(--muted);
+    }}
+
+    @keyframes slide-in {{
+      from {{
+        opacity: 0;
+        transform: translateY(18px);
+      }}
+      to {{
+        opacity: 1;
+        transform: translateY(0);
+      }}
+    }}
+
+    .media-wrap {{
+      position: relative;
+      cursor: pointer;
+    }}
+
+    .play-overlay {{
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0, 0, 0, 0.18);
+      pointer-events: none;
+    }}
+
+    .play-overlay svg {{
+      width: 56px;
+      height: 56px;
+      filter: drop-shadow(0 4px 12px rgba(0,0,0,.35));
+    }}
+
+    /* Lightbox */
+    .lightbox {{
+      position: fixed;
+      inset: 0;
+      z-index: 100;
+      background: rgba(0, 0, 0, 0.92);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      opacity: 0;
+      transition: opacity 240ms ease;
+      pointer-events: none;
+    }}
+
+    .lightbox.open {{
+      opacity: 1;
+      pointer-events: auto;
+    }}
+
+    .lightbox img {{
+      max-width: 95vw;
+      max-height: 95vh;
+      object-fit: contain;
+      border-radius: 8px;
+      box-shadow: 0 40px 80px rgba(0, 0, 0, 0.5);
+    }}
+
+    .lightbox-close {{
+      position: absolute;
+      top: 18px;
+      right: 22px;
+      width: 40px;
+      height: 40px;
+      border: 0;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.15);
+      color: #fff;
+      font-size: 1.5rem;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }}
+
+    @media (max-width: 760px) {{
+      .topbar-inner,
+      .page {{
+        padding-left: 14px;
+        padding-right: 14px;
+      }}
+
+      .profile-card {{
+        grid-template-columns: 1fr;
+        justify-items: center;
+        text-align: center;
+        gap: 18px;
+      }}
+
+      .profile-head,
+      .meta-grid {{
+        justify-content: center;
+      }}
+
+      .stats-pill {{
+        display: none;
+      }}
+
+      .post-card {{
+        border-radius: 22px;
+      }}
+    }}
+
+    @media (prefers-color-scheme: dark) {{
+      :root {{
+        --bg: #121212;
+        --surface: rgba(30, 30, 30, 0.92);
+        --surface-strong: #1e1e1e;
+        --text: #e4e4e4;
+        --muted: #9ca3af;
+        --line: rgba(255, 255, 255, 0.08);
+        --shadow: 0 24px 60px rgba(0, 0, 0, 0.4);
+      }}
+
+      body {{
+        background: linear-gradient(180deg, #1a1a1a 0%, #0f0f0f 100%);
+      }}
+
+      .topbar {{
+        background: rgba(18, 18, 18, 0.86);
+      }}
+
+      .bio {{
+        color: #c0c0c0;
+      }}
+
+      .post-stats span,
+      .stats-pill {{
+        background: rgba(255, 255, 255, 0.06);
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"></div>
+        <div class="brand-copy">
+          <div class="brand-title">{brand_title}</div>
+          <div class="brand-meta">{brand_meta}</div>
+        </div>
+      </div>
+      <div class="stats-pill">{stats_pill}</div>
+    </div>
+  </header>
+
+  <main class="page">
+    <section class="profile-card">
+      <div class="avatar-wrap">
+        <img class="avatar" src="{avatar_src}" alt="Avatar @{username}">
+      </div>
+      <div>
+        <div class="profile-head">
+          <div class="username">@{username}</div>
+          <div class="realname">{full_name}</div>
+        </div>
+        <div class="meta-grid">
+          <div><strong>{post_count}</strong> posts</div>
+          <div><strong>{followers}</strong> followers</div>
+          <div><strong>{followees}</strong> following</div>
+          <div><strong>{mode_label}</strong></div>
+        </div>
+        <div class="bio">{bio}</div>
+      </div>
+    </section>
+
+    <section class="feed-shell">
+      <div class="feed-column">
+        <div class="render-progress" id="render-progress"></div>
+        <div id="feed"></div>
+        <div id="empty" class="empty-state" hidden>Посты не найдены.</div>
+        <div id="loader" class="loader">Загружаю следующую порцию…</div>
+        <div id="sentinel"></div>
+      </div>
+    </section>
+  </main>
+
+  <div id="lightbox" class="lightbox" role="dialog" aria-label="Просмотр изображения">
+    <button class="lightbox-close" id="lightbox-close" aria-label="Закрыть">&times;</button>
+    <img id="lightbox-img" src="" alt="">
+  </div>
+
+  <script id="post-data" type="application/json">{post_data}</script>
+  <script>
+    const payload = JSON.parse(document.getElementById("post-data").textContent);
+    const posts = payload.posts || [];
+    const feed = document.getElementById("feed");
+    const empty = document.getElementById("empty");
+    const sentinel = document.getElementById("sentinel");
+    const loader = document.getElementById("loader");
+    const progress = document.getElementById("render-progress");
+    const batchSize = Math.max(1, payload.batch_size || 9);
+    let cursor = 0;
+
+    const escapeHtml = (value) => value
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;");
+
+    const formatCaption = (caption) => {{
+      if (!caption) {{
+        return '<div class="caption caption-empty">Без описания</div>';
+      }}
+      return `<div class="caption">${{escapeHtml(caption)}}</div>`;
+    }};
+
+    const renderProgress = () => {{
+      if (!posts.length) {{
+        progress.textContent = "";
+        return;
+      }}
+      progress.textContent = `Показано ${{Math.min(cursor, posts.length)}} из ${{posts.length}} постов`;
+    }};
+
+    const isVideo = (post) => post.kind_label === "Video";
+
+    const playIcon = `<svg viewBox="0 0 24 24" fill="white"><circle cx="12" cy="12" r="10" fill="rgba(0,0,0,.5)"/><polygon points="10,8 16,12 10,16" fill="white"/></svg>`;
+
+    const renderMedia = (post) => {{
+      const paths = post.media_paths || [post.local_media_path];
+      if (paths.length === 1) {{
+        const videoTag = isVideo(post) ? `<div class="play-overlay">${{playIcon}}</div>` : "";
+        return `<div class="media-wrap" data-src="${{escapeHtml(paths[0])}}"><img class="post-media" src="${{escapeHtml(paths[0])}}" alt="${{escapeHtml(post.alt_text)}}" loading="lazy">${{videoTag}}</div>`;
+      }}
+      const imgs = paths.map((p, i) =>
+        `<div class="media-wrap" data-src="${{escapeHtml(p)}}"><img class="post-media" src="${{escapeHtml(p)}}" alt="${{escapeHtml(post.alt_text)}}" loading="lazy">${{i === 0 && isVideo(post) ? playIcon : ""}}</div>`
+      ).join("");
+      const dots = paths.map((_, i) =>
+        `<span class="carousel-dot${{i === 0 ? " active" : ""}}"></span>`
+      ).join("");
+      return `<div class="carousel">${{imgs}}</div><div class="carousel-dots">${{dots}}</div>`;
+    }};
+
+    const lightbox = document.getElementById("lightbox");
+    const lightboxImg = document.getElementById("lightbox-img");
+    const lightboxClose = document.getElementById("lightbox-close");
+
+    const openLightbox = (src) => {{
+      lightboxImg.src = src;
+      lightbox.classList.add("open");
+    }};
+
+    const closeLightbox = () => {{
+      lightbox.classList.remove("open");
+      lightboxImg.src = "";
+    }};
+
+    lightboxClose.addEventListener("click", closeLightbox);
+    lightbox.addEventListener("click", (e) => {{
+      if (e.target === lightbox) closeLightbox();
+    }});
+    document.addEventListener("keydown", (e) => {{
+      if (e.key === "Escape") closeLightbox();
+    }});
+
+    const createCard = (post, index) => {{
+      const card = document.createElement("article");
+      card.className = "post-card";
+      card.style.animationDelay = `${{Math.min(index * 35, 220)}}ms`;
+      card.innerHTML = `
+        <div class="post-head">
+          <img class="avatar" src="${{escapeHtml(payload.profile.avatar_src)}}" alt="">
+          <div class="post-owner">
+            <strong>@${{escapeHtml(payload.profile.username)}}</strong>
+            <span>${{escapeHtml(post.date_label)}}</span>
+          </div>
+          <a class="post-link" href="${{escapeHtml(post.instagram_url)}}" target="_blank" rel="noreferrer">Instagram</a>
+        </div>
+        ${{renderMedia(post)}}
+        <div class="post-body">
+          <div class="post-stats">
+            <span>${{escapeHtml(post.likes_label)}}</span>
+            <span>${{escapeHtml(post.comments_label)}}</span>
+            <span>${{escapeHtml(post.kind_label)}}</span>
+          </div>
+          ${{formatCaption(post.caption)}}
+        </div>
+      `;
+
+      // Carousel scroll -> active dot
+      const carousel = card.querySelector(".carousel");
+      const dots = card.querySelectorAll(".carousel-dot");
+      if (carousel && dots.length > 1) {{
+        carousel.addEventListener("scroll", () => {{
+          const idx = Math.round(carousel.scrollLeft / carousel.clientWidth);
+          dots.forEach((d, i) => d.classList.toggle("active", i === idx));
+        }});
+      }}
+
+      // Lightbox on image click
+      card.querySelectorAll(".media-wrap").forEach((wrap) => {{
+        wrap.addEventListener("click", () => {{
+          const src = wrap.getAttribute("data-src");
+          if (src) openLightbox(src);
+        }});
+      }});
+
+      return card;
+    }};
+
+    const renderNextBatch = () => {{
+      if (!posts.length) {{
+        empty.hidden = false;
+        loader.classList.add("hidden");
+        return;
+      }}
+
+      const chunk = posts.slice(cursor, cursor + batchSize);
+      chunk.forEach((post, idx) => feed.appendChild(createCard(post, idx)));
+      cursor += chunk.length;
+      renderProgress();
+
+      if (cursor >= posts.length) {{
+        loader.classList.add("hidden");
+        observer.disconnect();
+      }}
+    }};
+
+    const observer = new IntersectionObserver((entries) => {{
+      for (const entry of entries) {{
+        if (entry.isIntersecting) {{
+          renderNextBatch();
+        }}
+      }}
+    }}, {{ rootMargin: "220px 0px" }});
+
+    renderNextBatch();
+    observer.observe(sentinel);
+  </script>
+</body>
+</html>
