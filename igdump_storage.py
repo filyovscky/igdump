@@ -33,9 +33,9 @@ def load_comment_cache(path: Path, username: str) -> tuple[list[dict[str, Any]],
     payload = read_json(path)
     if not isinstance(payload, dict) or not isinstance(payload.get("username"), str) or payload["username"].lower() != username.lower():
         if payload:
-            logger.warning("Кеш комментариев без владельца или от другого профиля не используется; комментарии будут собраны заново.")
+            logger.warning("Кеш данных без владельца или от другого профиля не используется; данные будут собраны заново.")
         return [], set()
-    records = payload.get("comments", [])
+    records = payload.get("records", payload.get("comments", []))
     completed = payload.get("completed_posts", [])
     if not isinstance(records, list) or not isinstance(completed, list):
         return [], set()
@@ -43,5 +43,5 @@ def load_comment_cache(path: Path, username: str) -> tuple[list[dict[str, Any]],
 
 
 def save_comment_cache(path: Path, username: str, records: list[dict[str, Any]], completed: set[str]) -> None:
-    write_json(path, {"version": 2, "username": username, "comments": records,
+    write_json(path, {"version": 3, "username": username, "records": records,
                       "completed_posts": sorted(completed), "updated_at": datetime.now(UTC).isoformat()})

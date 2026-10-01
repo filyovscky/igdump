@@ -1,6 +1,6 @@
 [project]
 name = "igdump"
-version = "0.3.0"
+version = "0.4.0"
 description = "Export Instagram posts to a static HTML feed with local media"
 requires-python = ">=3.11"
 dependencies = [
@@ -16,7 +16,7 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["insta_html_export", "igdump_storage"]
+py-modules = ["insta_html_export", "igdump_storage", "igdump_dates", "igdump_progress"]
 packages = ["igdump_assets"]
 
 [tool.setuptools.package-data]

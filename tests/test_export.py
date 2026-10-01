@@ -52,6 +52,58 @@ class CommandTests(unittest.TestCase):
 
 
 class ExportTests(unittest.TestCase):
+    def setUp(self):
+        opener = patch.object(app.webbrowser, "open", return_value=True)
+        self.browser_open = opener.start()
+        self.addCleanup(opener.stop)
+
+    def test_completed_timeline_with_unknown_total_is_reused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = app.parse_args(["oldest", "natgeo", "--limit", "100"])
+            root = Path(directory)
+            app.save_post_links(root, args, ["new", "old"], 0, True)
+            with patch.object(app, "fetch_authenticated_timeline_page") as fetch:
+                links = app.collect_post_links(MagicMock(), "natgeo", 0, root, args, [], None, "1")
+            fetch.assert_not_called()
+            self.assertEqual(links, ["new", "old"])
+
+    def test_duplicate_pages_do_not_stop_valid_pagination(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = app.parse_args(["oldest", "natgeo", "--limit", "100"])
+            root = Path(directory)
+            app.save_post_links(root, args, ["new", "old"], 0, False, "cursor0")
+            pages = [(["new"], f"cursor{i}", True) for i in range(1, 6)] + [(["old"], None, False)]
+            with patch.object(app, "fetch_authenticated_timeline_page", side_effect=pages) as fetch:
+                links = app.collect_post_links(MagicMock(), "natgeo", 0, root, args, [], None, "1")
+            self.assertEqual(fetch.call_count, 6)
+            self.assertEqual(links, ["new", "old"])
+            self.assertTrue(app.load_post_links(root, "natgeo")["completed"])
+
+    def test_repeated_cursor_stops_without_losing_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = app.parse_args(["oldest", "natgeo", "--limit", "100"])
+            root = Path(directory)
+            app.save_post_links(root, args, ["new"], 0, False, "cursor")
+            with patch.object(app, "fetch_authenticated_timeline_page", return_value=(["new"], "cursor", True)):
+                with self.assertRaises(app.ExportError):
+                    app.collect_post_links(MagicMock(), "natgeo", 0, root, args, [], None, "1")
+            self.assertEqual(app.load_post_links(root, "natgeo")["cursor"], "cursor")
+
+    def test_browser_opens_file_uri_and_can_be_disabled(self):
+        args = app.parse_args(["all", "natgeo"])
+        path = Path(tempfile.gettempdir()) / "Архив Instagram" / "index.html"
+        app.open_export(path, args)
+        self.browser_open.assert_called_once_with(path.resolve().as_uri())
+        self.browser_open.reset_mock()
+        args.no_open = True
+        app.open_export(path, args)
+        self.browser_open.assert_not_called()
+
+    def test_post_navigation_retries_transient_browser_error(self):
+        with patch.object(app, "_scrape_post_payload_once", side_effect=[app.PlaywrightError("ERR_QUIC_PROTOCOL_ERROR"), {"code": "A"}]) as scrape, patch.object(app, "_safe_sleep"):
+            self.assertEqual(app.scrape_post_payload(MagicMock(), "https://www.instagram.com/p/A/"), {"code": "A"})
+            self.assertEqual(scrape.call_count, 2)
+
     def test_atomic_state_write_keeps_previous_state_on_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
