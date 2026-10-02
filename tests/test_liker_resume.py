@@ -137,7 +137,7 @@ class ResumeTests(unittest.TestCase):
                 self.assertEqual(app.run_full(args), 0)
             self.assertEqual([item[0] for item in modes], ["full", "comments", "likers"])
             self.assertTrue(all(item[1:3] == (100, True) for item in modes))
-            opener.assert_called_once_with((Path(directory) / "full.html").as_uri())
+            opener.assert_called_once_with((Path(directory).resolve() / "full.html").as_uri())
 
     def test_full_reuses_selected_links_and_session_without_profile_requests(self):
         with tempfile.TemporaryDirectory() as directory:
