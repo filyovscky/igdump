@@ -1,11 +1,12 @@
 [project]
 name = "igdump"
-version = "0.4.0"
+version = "0.5.0"
 description = "Export Instagram posts to a static HTML feed with local media"
 requires-python = ">=3.11"
 dependencies = [
     "playwright>=1.40",
     "requests>=2.31",
+    "rich>=13.7",
 ]
 
 [project.scripts]

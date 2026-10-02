@@ -17,14 +17,18 @@ from html import escape
 from importlib.metadata import version as _pkg_version, PackageNotFoundError
 from pathlib import Path
 from typing import Any
+from collections import deque
 from urllib.parse import urlparse
+from string import Template
 
 # ── Debug log (structured, AI-readable) ──────────────────────────────────────
 
-_DEBUG_EVENTS: list[dict[str, Any]] = []
+_DEBUG_EVENTS = deque(maxlen=2000)
 _DEBUG_LOG_PATH: Path | None = None
 
 def _debug_event(event_type: str, message: str, **context) -> None:
+    if event_type == "http.send":
+        record_request()
     def redact(value):
         if isinstance(value, str):
             return re.sub(r"(sessionid|csrftoken)=([^&\s]+)", r"\1=***", value, flags=re.IGNORECASE)
@@ -45,7 +49,7 @@ def _save_debug_log(output_dir: Path) -> None:
     path = output_dir / ".debug_log.json"
     try:
         path.write_text(
-            json.dumps(_DEBUG_EVENTS, ensure_ascii=False, indent=2),
+            json.dumps(list(_DEBUG_EVENTS), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         _DEBUG_LOG_PATH = path
@@ -55,6 +59,9 @@ def _save_debug_log(output_dir: Path) -> None:
 
 def _patch_session_for_logging(session: requests.Session) -> None:
     """Monkey-patch session.send so every HTTP call is logged."""
+    if getattr(session, "_igdump_logged", False):
+        return
+    session._igdump_logged = True
     original_send = session.send
 
     def logged_send(request, **kwargs):
@@ -83,9 +90,9 @@ def _patch_session_for_logging(session: requests.Session) -> None:
     session.send = logged_send  # type: ignore[method-assign]
 
 import requests
-from igdump_storage import read_json, write_json, load_comment_cache, save_comment_cache
+from igdump_storage import read_json, write_json, load_comment_cache, save_comment_cache, LikerStore
 from igdump_dates import parse_date, post_date, date_matches, date_label
-from igdump_progress import format_progress
+from igdump_progress import update_progress, TerminalUI, record_request, prompt_input
 from playwright.sync_api import BrowserContext, Error as PlaywrightError, Page, Playwright, TimeoutError, sync_playwright
 
 logger = logging.getLogger("igdump")
@@ -118,7 +125,7 @@ HTML_TEMPLATE = (TEMPLATE_DIR / "index.html").read_text(encoding="utf-8")
 try:
     VERSION = _pkg_version("igdump")
 except PackageNotFoundError:
-    VERSION = "0.4.0"
+    VERSION = "0.5.0"
 
 
 class ExportError(RuntimeError):
@@ -190,7 +197,7 @@ class InstagramBrowser:
         logger.warning("No saved Instagram session in %s", self.profile_dir)
         logger.warning("A Chrome window was opened. Log into Instagram there, then return here.")
         try:
-            input("Press Enter after the Instagram home page is fully loaded, or Ctrl+C to abort: ")
+            prompt_input("Press Enter after the Instagram home page is fully loaded, or Ctrl+C to abort: ")
         finally:
             page.close()
 
@@ -280,7 +287,7 @@ def nonnegative_delay(value: str) -> float:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Выгрузка Instagram в локальный HTML-архив. Выберите одну команду: all, oldest, comments или likers.",
+        description="Выгрузка Instagram в локальный HTML-архив. Выберите одну команду: all, oldest, comments, likers или full.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Примеры:
   python insta_html_export.py all @kharlamova_alena
@@ -291,6 +298,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
       Комментарии к 100 последним постам (0 или без --limit = все).
   python insta_html_export.py likers @kharlamova_alena --after 01.01.2024 --before 31.12.2024
       Доступные лайкеры постов, опубликованных в 2024 году.
+
+  python insta_html_export.py full @kharlamova_alena --limit 100
+      Посты, статистика комментаторов и лайкеров в одной папке.
 
 all и oldest — отдельные команды, их нельзя писать вместе.
 Число постов указывается как --limit 100, а не отдельным аргументом.
@@ -401,12 +411,24 @@ all и oldest — отдельные команды, их нельзя писа�
     likers_parser.add_argument("--limit", type=nonnegative_int, default=0, help="Последние N постов после отбора по датам (0 = все).")
     likers_parser.add_argument("--like-delay", type=nonnegative_delay, default=2.0, help="Задержка запросов лайкеров в секундах (по умолчанию 2).")
     likers_parser.add_argument("--sessionid", default=None, help="Instagram sessionid; сохранённая сессия используется автоматически.")
+    for interaction_parser in (comments_parser, likers_parser):
+        interaction_parser.add_argument("--offline", action="store_true", help="Пересчитать HTML и CSV из кеша без входа и HTTP-запросов.")
+    likers_parser.add_argument("--retry-missing", action="store_true", help="Повторить неполные списки и сетевые сбои; объединить найденных лайкеров без дублей.")
+    full_parser = subparsers.add_parser("full", parents=[common_parent], help="Посты, комментарии и лайкеры в одной папке с общим отчётом.")
+    full_parser.add_argument("--limit", type=nonnegative_int, default=0, help="Последние N постов после фильтров дат (0 = все).")
+    full_parser.add_argument("--download-videos", action="store_true", help="Скачивать сами видео; по умолчанию только обложки.")
+    full_parser.add_argument("--sessionid", default=None)
+    full_parser.add_argument("--comment-delay", type=nonnegative_delay, default=2.0)
+    full_parser.add_argument("--like-delay", type=nonnegative_delay, default=2.0)
+    full_parser.add_argument("--retry-missing", action="store_true")
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments[:2] == ["all", "oldest"]:
         parser.error("all и oldest — отдельные команды. Для первых 100 постов: python insta_html_export.py oldest @kharlamova_alena --limit 100")
     parsed = parser.parse_args(arguments)
     if parsed.after and parsed.before and parsed.after > parsed.before:
         parser.error("Дата --after должна быть не позже --before.")
+    if getattr(parsed, "offline", False) and (parsed.refresh or getattr(parsed, "retry_missing", False)):
+        parser.error("--offline нельзя совмещать с --refresh или --retry-missing.")
     return parsed
 
 
@@ -438,7 +460,9 @@ def ensure_output_dir(base: str | None, args: argparse.Namespace) -> Path:
         root = Path(base).expanduser().resolve()
     else:
         root = (Path.cwd() / "exports" / build_job_slug(args)).resolve()
-    (root / "media").mkdir(parents=True, exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True)
+    if args.mode in ("all", "oldest", "full"):
+        (root / "media").mkdir(exist_ok=True)
     return root
 
 
@@ -805,6 +829,7 @@ def fetch_profile_info(session: requests.Session, username: str) -> tuple[dict[s
 
     media = user.get("edge_owner_to_timeline_media") or {}
     edges = media.get("edges") or []
+    remember_post_dates(session, [edge.get("node") or {} for edge in edges])
     initial_links = []
     for edge in edges:
         node = edge.get("node") or {}
@@ -999,6 +1024,7 @@ def collect_post_links(
     initial_cursor: str | None,
     user_id: str | None = None,
 ) -> list[str]:
+    save_post_metadata(session, output_dir, username)
     cache = load_post_links(output_dir, username) if not getattr(args, "refresh", False) else {"links": [], "completed": False, "cursor": None}
     links = unique_keep_order([*seed_links, *cache["links"]])
     if cache["completed"] and (not total_available or len(links) >= total_available):
@@ -1040,11 +1066,12 @@ def collect_post_links(
         cursor = next_cursor
 
         save_post_links(output_dir, args, links, total_available, completed=False, cursor=cursor)
+        save_post_metadata(session, output_dir, username)
 
         if new_count:
-            logger.info("%s", format_progress("Ссылки", len(links), total_available or None))
+            update_progress("Ссылки", len(links), total_available or None)
         else:
-            logger.info("%s", format_progress("Ссылки", len(links), total_available or None, "страница из кеша; проверяем продолжение"))
+            update_progress("Ссылки", len(links), total_available or None, "страница из кеша; проверяем продолжение")
 
         if cursor is None:
             break
@@ -1266,8 +1293,10 @@ def build_post_record(session: requests.Session, payload: dict[str, Any], media_
 
 
 def build_mode_label(args: argparse.Namespace) -> str:
-    if args.mode == "all":
+    if args.mode in ("all", "full"):
         label = "Все выбранные посты, новые сверху"
+        if args.mode == "full" and args.limit:
+            label = f"Последние {args.limit} выбранных постов, новые сверху"
     else:
         label = f"Первые {args.limit} выбранных постов, ранние сверху"
     dates = date_label(args.after, args.before)
@@ -1317,11 +1346,33 @@ def remember_post_dates(session: requests.Session, items: list[dict[str, Any]]) 
     if not isinstance(dates, dict):
         dates = {}
         session._igdump_post_dates = dates
+    counts = getattr(session, "_igdump_post_likes", None)
+    if not isinstance(counts, dict):
+        counts = session._igdump_post_likes = {}
     for item in items:
         code = item.get("code") or item.get("shortcode")
+        count = item.get("like_count")
+        if count is None:
+            count = (item.get("edge_media_preview_like") or item.get("edge_liked_by") or {}).get("count")
+        if code and isinstance(count, int) and count >= 0:
+            counts[code] = count
         value = post_date(item)
         if code and value:
             dates[code] = value.isoformat()
+
+
+def save_post_metadata(session, output_dir, username):
+    path = output_dir / ".post-likes.json"
+    payload = read_json(path) or {}
+    counts = payload.get("counts", {}) if payload.get("username") == username else {}
+    if not isinstance(counts, dict):
+        counts = {}
+    fresh = getattr(session, "_igdump_post_likes", None)
+    if isinstance(fresh, dict):
+        counts.update(fresh)
+    counts = {code: count for code, count in counts.items() if isinstance(count, int) and count >= 0}
+    write_json(path, {"username": username, "counts": counts})
+    return counts
 
 
 def fetch_post_date(session: requests.Session, url: str) -> str | None:
@@ -1361,6 +1412,8 @@ def filter_links_by_date(links: list[str], args: argparse.Namespace, session: re
     for index, url in enumerate(links, start=1):
         code = parse_shortcode_from_url(url)
         if code not in dates:
+            if getattr(args, "offline", False):
+                raise ExportError(f"В кеше нет даты {code}; сначала запустите сбор без --offline.")
             logger.info("Проверка даты %s/%s: %s", index, len(links), code)
             _safe_sleep(1)
             dates[code] = fetch_post_date(session, url)
@@ -1375,7 +1428,7 @@ def filter_links_by_date(links: list[str], args: argparse.Namespace, session: re
             raise ExportError("Кеш дат повреждён. Повторите команду с --refresh.") from None
         if date_matches(value, args.after, args.before):
             selected.append(url)
-        logger.info("%s", format_progress("Даты", index, len(links)))
+        update_progress("Даты", index, len(links))
     logger.info("По датам выбрано %s из %s постов (%s).", len(selected), len(links), date_label(args.after, args.before))
     if unknown:
         raise ExportError(f"У {unknown} постов неизвестна дата. Отбор не завершён; повторите с --refresh для проверки дат.")
@@ -1389,7 +1442,7 @@ def select_post_links(all_links: list[str], args: argparse.Namespace) -> list[st
     limit = getattr(args, "limit", 0)
     if limit <= 0:
         return all_links
-    if args.mode in ("comments", "likers"):
+    if args.mode in ("comments", "likers", "full"):
         return all_links[:limit]
     return list(reversed(all_links[-limit:]))
 
@@ -1412,6 +1465,8 @@ def run(args: argparse.Namespace) -> int:
         browser.ensure_logged_in()
         preflight_instagram_access(browser)
         session = browser.authenticated_session()
+        _patch_session_for_logging(session)
+        args._shared_session = session
         profile, _, _, user_id = fetch_profile_info(session, args.username)
         logger.info("Resolved @%s profile metadata", profile["username"])
 
@@ -1446,6 +1501,7 @@ def run(args: argparse.Namespace) -> int:
 
         filtered_links = filter_links_by_date(all_links, args, session, output_dir)
         selected_links = select_post_links(filtered_links, args)
+        args._selected_links = selected_links
         if args.dry_run:
             logger.info("Dry-run: %s/%s posts selected for export", len(selected_links), len(all_links))
             return 0
@@ -1499,6 +1555,7 @@ def run(args: argparse.Namespace) -> int:
             need_scrape.append((index, post_url, shortcode))
 
         def checkpoint(completed: bool = False) -> None:
+            save_post_metadata(session, output_dir, args.username)
             by_code = {record["shortcode"]: record for record in post_records}
             ordered = [by_code[code] for url in selected_links
                        if (code := parse_shortcode_from_url(url)) in by_code]
@@ -1508,21 +1565,22 @@ def run(args: argparse.Namespace) -> int:
 
         checkpoint()
         errors: list[str] = []
-        logger.info("%s", format_progress("Посты", len(post_records), len(selected_links)))
+        update_progress("Посты", len(post_records), len(selected_links))
         for index, post_url, shortcode in need_scrape:
             logger.info("Пост %s/%s: %s", index, len(selected_links), shortcode)
             try:
                 payload = scrape_post_payload(browser, post_url)
+                remember_post_dates(session, [{**payload, "code": shortcode}])
                 record = build_post_record(session, payload, output_dir / "media", index, post_url,
                                            download_videos=args.download_videos)
             except (ExportError, requests.RequestException, PlaywrightError, OSError) as exc:
                 logger.error("Не удалось выгрузить %s: %s", shortcode, exc)
                 errors.append(shortcode)
-                logger.info("%s", format_progress("Посты", len(post_records) + len(errors), len(selected_links), "ошибка"))
+                update_progress("Посты", len(post_records) + len(errors), len(selected_links), "ошибка")
                 continue
             post_records.append(record)
             checkpoint()
-            logger.info("%s", format_progress("Посты", len(post_records) + len(errors), len(selected_links)))
+            update_progress("Посты", len(post_records) + len(errors), len(selected_links))
 
         completed = len(post_records) == len(selected_links) and not errors and timeline_complete
         checkpoint(completed)
@@ -1538,6 +1596,9 @@ def run(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
     args = parse_args()
     if args.verbose:
         level = logging.DEBUG
@@ -1545,12 +1606,16 @@ def main() -> int:
         level = logging.WARNING
     else:
         level = logging.INFO
-    logging.basicConfig(
-        format="%(levelname)s %(message)s",
-        level=level,
-        stream=sys.stderr,
-    )
+    ui = TerminalUI(quiet=args.quiet)
+    logging.basicConfig(level=level, handlers=[ui], force=True)
+    with ui:
+        return execute(args)
+
+
+def execute(args: argparse.Namespace) -> int:
     try:
+        if args.mode == "full":
+            return run_full(args)
         if args.mode in ("comments", "likers"):
             return run_comments(args)
         return run(args)
@@ -1706,55 +1771,73 @@ def build_comment_record(comment: dict[str, Any], shortcode: str) -> dict[str, A
 
 def fetch_all_likers(session: requests.Session, shortcode: str, delay: float) -> list[dict[str, Any]]:
     users: dict[str, dict[str, Any]] = {}
-    expected_count = 0
-    cursor: str | None = None
-    seen_cursors: set[str] = set()
+    expected_count = None
+    callback = getattr(session, "_igdump_liker_page_callback", None)
+    streaming = callable(callback) and isinstance(session, requests.Session)
+    resume = getattr(session, "_igdump_liker_resume_cursor", None)
+    cursor = resume if isinstance(resume, str) else None
+    seen_cursors = {cursor} if cursor else set()
     while True:
         _safe_sleep(delay)
         params = {"max_id": cursor} if cursor else {}
-        response = session.get(f"{IG_BASE_URL}/api/v1/media/{shortcode_to_media_id(shortcode)}/likers/",
-                               params=params, timeout=30, allow_redirects=False)
-        try:
-            if response.status_code in (301, 302, 303, 307, 308, 401, 403):
-                raise ExportError("Instagram не разрешил получить лайкеров. Проверьте вход и доступ к посту.")
-            if response.status_code == 429:
-                raise ExportError("Instagram ограничил запросы лайкеров (429). Повторите команду позже.")
-            response.raise_for_status()
-            data = response.json()
-            if data.get("status") == "fail" or "users" not in data:
-                raise ExportError(f"Instagram не вернул список лайкеров: {data.get('message', 'API error')}")
-            for user in data.get("users") or []:
+        for attempt in range(3):
+            response = None
+            try:
+                response = session.get(f"{IG_BASE_URL}/api/v1/media/{shortcode_to_media_id(shortcode)}/likers/",
+                                       params=params, timeout=30, allow_redirects=False)
+                if response.status_code in (301, 302, 303, 307, 308, 401, 403):
+                    raise ExportError("Instagram не разрешил получить лайкеров. Проверьте вход и доступ к посту.")
+                if response.status_code == 429:
+                    raise ExportError("Instagram ограничил запросы лайкеров (429). Повторите команду позже.")
+                response.raise_for_status()
+                data = response.json()
+                break
+            except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as exc:
+                if attempt == 2 or (isinstance(exc, requests.HTTPError) and response.status_code < 500):
+                    raise
+                logger.warning("Обрыв запроса %s; повтор %s/2 через %s с", shortcode, attempt + 1, 2 ** (attempt + 1))
+                _safe_sleep(2 ** (attempt + 1), jitter=0)
+            finally:
+                if response is not None:
+                    response.close()
+        if data.get("status") == "fail" or "users" not in data:
+            raise ExportError(f"Instagram не вернул список лайкеров: {data.get('message', 'API error')}")
+        page_users = data.get("users") or []
+        if not streaming:
+            for user in page_users:
                 key = str(user.get("pk") or user.get("id") or user.get("username") or "")
                 if key:
                     users[key] = user
-            reported_count = data.get("user_count", data.get("like_count", 0))
-            if isinstance(reported_count, int):
-                expected_count = max(expected_count, reported_count)
-            next_cursor = data.get("next_max_id")
-            has_more = bool(data.get("has_more_likers", data.get("has_more", data.get("more_available", bool(next_cursor)))))
-            if not has_more:
-                break
-            if not next_cursor or next_cursor in seen_cursors:
-                raise ExportError("Instagram не вернул новую страницу лайкеров; сбор этого поста не завершён.")
-            seen_cursors.add(next_cursor)
-            cursor = next_cursor
-        finally:
-            response.close()
+        reported_count = data.get("user_count", data.get("like_count"))
+        if isinstance(reported_count, int):
+            expected_count = reported_count
+        next_cursor = data.get("next_max_id")
+        has_more = bool(data.get("has_more_likers", data.get("has_more", data.get("more_available", bool(next_cursor)))))
+        if streaming:
+            callback(shortcode, page_users, expected_count, next_cursor if has_more else None)
+        if not has_more:
+            break
+        if not next_cursor or next_cursor in seen_cursors:
+            raise ExportError("Instagram не вернул новую страницу лайкеров; сбор этого поста не завершён.")
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+    counts = getattr(session, "_igdump_liker_counts", None)
+    if not isinstance(counts, dict):
+        counts = session._igdump_liker_counts = {}
+    counts[shortcode] = expected_count
     incomplete = getattr(session, "_igdump_incomplete_likers", None)
     if not isinstance(incomplete, set):
-        incomplete = set()
-        session._igdump_incomplete_likers = incomplete
+        incomplete = session._igdump_incomplete_likers = set()
     incomplete.discard(shortcode)
-    if expected_count > len(users):
+    if not streaming and expected_count is not None and expected_count > len(users):
         incomplete.add(shortcode)
         logger.warning("Instagram вернул только %s из %s лайкеров поста %s. Статистика будет частичной.", len(users), expected_count, shortcode)
     return list(users.values())
 
 
 def build_liker_record(user: dict[str, Any], shortcode: str) -> dict[str, Any]:
-    record = build_comment_record({"pk": user.get("pk") or user.get("id") or user.get("username"), "user": user}, shortcode)
-    record["user_id"] = record["comment_id"]
-    return record
+    return {"post_shortcode": shortcode, "user_id": str(user.get("pk") or user.get("id") or user.get("username") or ""),
+            "username": user.get("username", "unknown"), "full_name": user.get("full_name", "")}
 
 
 def aggregate_comment_stats(
@@ -1810,92 +1893,6 @@ def aggregate_comment_stats(
         "participants": commenters,
         "top_posts": [{"shortcode": sc, "count": n} for sc, n in top_posts],
     }
-
-
-COMMENTS_HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title}</title>
-<style>
-  :root {{ --bg:#fafafa; --surface:#fff; --text:#111; --muted:#6b7280; --line:rgba(17,17,17,.08); --accent:#ff4f8b; }}
-  * {{ box-sizing:border-box; }}
-  body {{ margin:0; font-family:system-ui,sans-serif; color:var(--text); background:var(--bg); }}
-  .wrap {{ max-width:900px; margin:0 auto; padding:24px 16px 48px; }}
-  h1 {{ font-size:1.4rem; }}
-  .stat-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:12px; margin:20px 0; }}
-  .stat-card {{ border:1px solid var(--line); border-radius:14px; padding:16px; text-align:center; background:var(--surface); }}
-  .stat-card .num {{ font-size:1.6rem; font-weight:700; color:var(--accent); }}
-  .stat-card .label {{ font-size:.85rem; color:var(--muted); margin-top:4px; }}
-  .section {{ margin-top:28px; }}
-  .section h2 {{ font-size:1.15rem; margin-bottom:12px; }}
-  table {{ width:100%; border-collapse:collapse; font-size:.9rem; }}
-  th,td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); }}
-  th {{ color:var(--muted); font-weight:600; font-size:.8rem; text-transform:uppercase; }}
-  .rank {{ color:var(--muted); width:28px; }}
-  .user-cell {{ display:flex; align-items:center; gap:8px; }}
-  .user-cell img, .user-avatar {{ display:inline-block; width:28px; height:28px; border-radius:50%; background:#ececec; }}
-  .truncate {{ max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
-  .pill {{ display:inline-block; padding:2px 10px; border-radius:999px; background:rgba(255,79,139,.1); color:var(--accent); font-size:.8rem; font-weight:600; }}
-  .user-link {{ color:inherit; text-decoration:none; }}
-  .user-link:hover {{ text-decoration:underline; }}
-  .post-link {{ color:var(--accent); text-decoration:none; font-weight:500; }}
-  .post-link:hover {{ text-decoration:underline; }}
-  @media(prefers-color-scheme:dark) {{ :root {{ --bg:#121212; --surface:#1e1e1e; --text:#e4e4e4; --muted:#9ca3af; --line:rgba(255,255,255,.08); }} }}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <h1>{interaction_title} — @{username}</h1>
-  <p style="color:var(--muted);font-size:.9rem">{export_date} • {date_range}</p>
-  <p>{completion_note}</p>
-
-  <div class="stat-grid" id="stats"></div>
-
-  <div class="section" id="top-commenters-section">
-    <h2>{top_users_title}</h2>
-    <div id="top-commenters"></div>
-  </div>
-
-  <div class="section" id="top-posts-section">
-    <h2>{top_posts_title}</h2>
-    <div id="top-posts"></div>
-  </div>
-</div>
-
-<script id="comment-data" type="application/json">{comment_json}</script>
-<script>
-const data = JSON.parse(document.getElementById('comment-data').textContent);
-const s = data.stats;
-
-// Stat cards
-document.getElementById('stats').innerHTML = `
-  <div class="stat-card"><div class="num">${{ s.total_comments }}</div><div class="label">{interaction_label}</div></div>
-  <div class="stat-card"><div class="num">${{ s.unique_commenters }}</div><div class="label">{unique_label}</div></div>
-  <div class="stat-card"><div class="num">${{ s.posts_with_comments }}/${{ s.total_posts }}</div><div class="label">{posts_label}</div></div>
-  <div class="stat-card"><div class="num">${{ s.avg_per_post }}</div><div class="label">Avg per post</div></div>
-`;
-
-const esc = v => String(v).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
-
-const renderUser = u => `<div class="user-cell">${{u.profile_pic_url ? `<img src="${{esc(u.profile_pic_url)}}" alt="">` : '<span class="user-avatar" aria-hidden="true"></span>'}}<a class="user-link" href="https://www.instagram.com/${{ esc(u.username) }}/" target="_blank">${{ esc(u.username) }}</a></div>`;
-
-// Top commenters
-document.getElementById('top-commenters').innerHTML = `<table>
-  <tr><th>#</th><th>User</th><th>{interaction_label}</th><th>Posts</th></tr>
-  ${{ s.top_commenters.map((u,i) => `<tr><td class="rank">${{ i+1 }}</td><td>${{ renderUser(u) }}</td><td><span class="pill">${{ u.count }}</span></td><td>${{ u.posts_commented }}</td></tr>`).join('') }}
-</table>`;
-
-// Top posts
-document.getElementById('top-posts').innerHTML = `<table>
-  <tr><th>#</th><th>Post</th><th>{interaction_label}</th></tr>
-  ${{ s.top_posts.map((p,i) => `<tr><td class="rank">${{ i+1 }}</td><td><a class="post-link" href="https://www.instagram.com/p/${{ esc(p.shortcode) }}/" target="_blank">${{ esc(p.shortcode) }}</a></td><td><span class="pill">${{ p.count }}</span></td></tr>`).join('') }}
-</table>`;
-</script>
-</body>
-</html>
-"""
 
 
 CONFIG_DIR = Path.home() / ".insta-export"
@@ -1993,13 +1990,30 @@ def run_comments(args: argparse.Namespace) -> int:
     kind = args.mode
     is_likes = kind == "likers"
     output_dir = ensure_output_dir(args.output_dir, args)
+    if getattr(args, "offline", False):
+        cached = load_post_links(output_dir, args.username)
+        if not cached["links"]:
+            raise ExportError("В папке нет сохранённого списка постов. Укажите папку сбора через --output-dir.")
+        if not any((output_dir / name).exists() for name in (f".{kind}.json", f".{kind}.sqlite")):
+            raise ExportError("В папке нет сохранённых данных для пересчёта; сначала выполните сбор без --offline.")
+        session = requests.Session()
+        links = select_post_links(filter_links_by_date(cached["links"], args, session, output_dir), args)
+        if is_likes:
+            return export_likers(args, session, output_dir, args.username, links)
+        return export_cached_comments(args, output_dir, links)
+    shared_links = getattr(args, "_selected_links", None)
+    shared_session = getattr(args, "_shared_session", None)
+    if shared_links is not None and shared_session is not None:
+        if is_likes:
+            return export_likers(args, shared_session, output_dir, args.username, shared_links)
+        return export_comments(args, shared_session, output_dir, args.username, shared_links)
     profile_dir = Path(args.browser_profile_dir).expanduser().resolve()
 
-    session: requests.Session | None = None
+    session: requests.Session | None = getattr(args, "_shared_session", None)
     profile = None
 
     # 1. Try --sessionid flag (explicit)
-    if args.sessionid:
+    if session is None and args.sessionid:
         try:
             session = _session_from_sessionid(args.sessionid)
             _save_config({**{"sessionid": args.sessionid}})
@@ -2033,7 +2047,7 @@ def run_comments(args: argparse.Namespace) -> int:
     while session is None:
         logger.warning("No Instagram session found. Paste your sessionid cookie (F12 → Application → Cookies → sessionid):")
         try:
-            raw = input("sessionid: ").strip()
+            raw = prompt_input("sessionid: ").strip()
             if not raw:
                 logger.error("No sessionid provided.")
                 _save_debug_log(output_dir)
@@ -2049,6 +2063,8 @@ def run_comments(args: argparse.Namespace) -> int:
             logger.error("Aborted.")
             _save_debug_log(output_dir)
             return 1
+
+    _patch_session_for_logging(session)
 
     # Fetch profile metadata (non-fatal — comments can proceed without it)
     profile, initial_links, end_cursor, user_id = None, [], None, None
@@ -2106,7 +2122,15 @@ def run_comments(args: argparse.Namespace) -> int:
         _save_debug_log(output_dir)
         return 0
 
-    delay = args.like_delay if is_likes else args.comment_delay
+    if is_likes:
+        return export_likers(args, session, output_dir, username, selected_links)
+
+    return export_comments(args, session, output_dir, username, selected_links)
+
+
+def export_comments(args, session, output_dir, username, selected_links):
+    kind = "comments"
+    delay = args.comment_delay
 
     comments_file = output_dir / f".{kind}.json"
     all_cached_records, completed_posts = load_comment_cache(comments_file, username)
@@ -2116,28 +2140,26 @@ def run_comments(args: argparse.Namespace) -> int:
     for index, post_url in enumerate(selected_links, start=1):
         shortcode = parse_shortcode_from_url(post_url)
         if shortcode in completed_posts and not args.refresh:
-            logger.info("%s", format_progress("Лайкеры" if is_likes else "Комментарии", index, len(selected_links), "из кеша"))
+            update_progress("Комментарии", index, len(selected_links), "из кеша")
             continue
-        logger.info("%s %s/%s: %s", "Лайкеры" if is_likes else "Комментарии", index, len(selected_links), shortcode)
+        logger.info("%s %s/%s: %s", "Комментарии", index, len(selected_links), shortcode)
         try:
-            raw_comments = fetch_all_likers(session, shortcode, delay) if is_likes else fetch_all_comments(session, shortcode, delay)
-            records = [build_liker_record(c, shortcode) if is_likes else build_comment_record(c, shortcode) for c in raw_comments]
+            raw_comments = fetch_all_comments(session, shortcode, delay)
+            records = [build_comment_record(c, shortcode) for c in raw_comments]
         except (ExportError, requests.RequestException, ValueError) as exc:
-            logger.error("Не удалось собрать %s для %s: %s", "лайкеров" if is_likes else "комментарии", shortcode, exc)
+            logger.error("Не удалось собрать %s для %s: %s", "комментарии", shortcode, exc)
             errors.append(shortcode)
-            logger.info("%s", format_progress("Лайкеры" if is_likes else "Комментарии", index, len(selected_links), "ошибка"))
+            update_progress("Комментарии", index, len(selected_links), "ошибка")
+            if "429" in str(exc) or "Rate limited" in str(exc):
+                args._rate_limited = True
+                break
             continue
         all_cached_records = [record for record in all_cached_records if record.get("post_shortcode") != shortcode]
         all_cached_records.extend(records)
-        incomplete_likers = getattr(session, "_igdump_incomplete_likers", None)
-        if is_likes and isinstance(incomplete_likers, set) and shortcode in incomplete_likers:
-            errors.append(shortcode)
-            completed_posts.discard(shortcode)
-        else:
-            completed_posts.add(shortcode)
+        completed_posts.add(shortcode)
         save_comment_cache(comments_file, username, all_cached_records, completed_posts)
         logger.info("Сохранено %s записей", len(records))
-        logger.info("%s", format_progress("Лайкеры" if is_likes else "Комментарии", index, len(selected_links)))
+        update_progress("Комментарии", index, len(selected_links))
 
     all_comment_records = [record for record in all_cached_records if record.get("post_shortcode") in selected_codes]
     logger.info("Обработано %s из %s постов; записей: %s; ошибок: %s",
@@ -2145,44 +2167,174 @@ def run_comments(args: argparse.Namespace) -> int:
     _debug_event("comments.done", "Comments export finished", count=len(all_comment_records), errors=errors)
 
     stats = aggregate_comment_stats(all_comment_records, len(selected_links))
-    raw_json = json.dumps({"stats": stats}, ensure_ascii=False).replace("</", "<\\/")
-    display_username = profile["username"] if profile else args.username
-    html = COMMENTS_HTML_TEMPLATE.format(
-        title=escape(f"{'Likes' if is_likes else 'Comments'} Export — @{display_username}"),
-        interaction_title="Likes Export" if is_likes else "Comments Export",
-        interaction_label="Likes" if is_likes else "Comments",
-        unique_label="Unique likers" if is_likes else "Unique commenters",
-        posts_label="Posts with likes" if is_likes else "Posts with comments",
-        top_users_title="Top likers" if is_likes else "Top commenters",
-        top_posts_title="Most liked posts (collected users)" if is_likes else "Most commented posts",
-        date_range=escape(date_label(args.after, args.before) or "All publication dates"),
-        completion_note=escape(f"Processed {len(selected_codes & completed_posts)} of {len(selected_codes)} posts. Errors: {len(errors)}. " + ("Statistics cover users returned by Instagram; some likes may be hidden." if is_likes else "Statistics cover collected comments; replies may not be included.")),
-        username=escape(display_username),
-        export_date=escape(datetime.now().strftime("%d.%m.%Y %H:%M")),
-        comment_json=raw_json,
-    )
-    comments_html = output_dir / f"{kind}.html"
-    comments_html.write_text(html, encoding="utf-8")
-    logger.info("Comments saved to %s", comments_html)
-
-    # Also save CSV
-    try:
-        if is_likes:
-            _save_likers_csv(all_comment_records, output_dir)
-        else:
-            _save_comments_csv(all_comment_records, output_dir)
-        _save_participant_stats(stats, output_dir, kind)
-    except Exception as exc:
-        logger.warning("Could not save CSV: %s", exc)
-        errors.append(f"{kind}.csv")
-
-    print(comments_html.as_uri())
-    open_export(comments_html, args)
+    _save_comments_csv(all_comment_records, output_dir)
+    write_interaction_report(args, output_dir, stats, f"Processed {len(selected_codes & completed_posts)} of {len(selected_codes)} posts. Errors: {len(errors)}.")
     _save_debug_log(output_dir)
     return 4 if errors else 0
 
 
-def _save_likers_csv(records: list[dict[str, Any]], output_dir: Path) -> None:
+def write_interaction_report(args, output_dir, stats, coverage):
+    likes = args.mode == "likers"
+    label = "Likes" if likes else "Comments"
+    user_rows = []
+    for i, user in enumerate(stats["top_commenters"], 1):
+        name = escape(user["username"])
+        extra = "" if likes else f'<td>{user["posts_commented"]}</td>'
+        user_rows.append(f'<tr><td>{i}</td><td><a href="https://www.instagram.com/{name}/">{name}</a><span class="name">{escape(user["full_name"])}</span></td><td>{user["count"]}</td>{extra}</tr>')
+    post_rows = []
+    for i, post in enumerate(stats["top_posts"][:10], 1):
+        code = escape(post["shortcode"])
+        extra = f'<td>{post.get("collected", post["count"])}</td>' if likes else ""
+        value = str(post["count"]) + (" (collected)" if likes and post.get("estimated") else "")
+        post_rows.append(f'<tr><td>{i}</td><td><a href="https://www.instagram.com/p/{code}/">{code}</a></td><td>{value}</td>{extra}</tr>')
+    template = Template((TEMPLATE_DIR / "interactions.html").read_text(encoding="utf-8"))
+    html = template.substitute(title=escape(f"{label} — @{args.username}"), kind=args.mode, label=label,
+        date=datetime.now().strftime("%d.%m.%Y %H:%M"), range=escape(date_label(args.after, args.before) or "All publication dates"),
+        coverage=escape(coverage), total=stats["total_comments"], users=stats["unique_commenters"], posts=stats["total_posts"],
+        extra_link='<a href="likers-coverage.csv">Coverage by post · CSV</a>' if likes else "",
+        users_title="Top likers" if likes else "Top commenters", posts_title="Top-10 most liked posts" if likes else "Top-10 most commented posts",
+        user_extra_head="" if likes else "<th>Posts</th>", post_extra_head="<th>Collected users</th>" if likes else "",
+        user_rows="".join(user_rows), post_rows="".join(post_rows),
+        ranking_note=("Ranked by Instagram's reported count where available; cached posts without a count use collected users. Counts and accessible lists may differ." if likes else "Based on collected comments. Replies may not be included."))
+    path = output_dir / f"{args.mode}.html"
+    path.write_text(html, encoding="utf-8")
+    _save_participant_stats(stats, output_dir, args.mode)
+    logger.info("Отчёт сохранён: %s", path)
+    print(path.as_uri())
+    open_export(path, args)
+    return path
+
+
+def export_likers(args, session, output_dir, username, selected_links):
+    store = LikerStore(output_dir / ".likers.sqlite", username)
+    try:
+        store.migrate(output_dir / ".likers.json")
+        metadata_path = output_dir / ".post-likes.json"
+        post_counts = save_post_metadata(session, output_dir, username)
+        # Full exports already have post counters: reuse them without a metadata request.
+        post_state = read_json(output_dir / ".export-state.json") or {}
+        if post_state.get("job", {}).get("username") == username:
+            for post in post_state.get("post_records", []):
+                label = post.get("likes_label", "").removeprefix("Likes: ").replace(" ", "")
+                if label.isdecimal():
+                    post_counts.setdefault(post["shortcode"], int(label))
+        write_json(metadata_path, {"username": username, "counts": post_counts})
+        codes = [parse_shortcode_from_url(url) for url in selected_links]
+        store.select(set(codes))
+        failed = []
+        offline = getattr(args, "offline", False)
+        session._igdump_liker_page_callback = store.add_page
+        for index, code in enumerate(codes, 1):
+            state = store.state(code)
+            if code in post_counts:
+                count = post_counts[code]
+                store.mark(code, "partial" if state["state"] == "complete" and store.count(code) < count else state["state"], expected=count)
+                state = store.state(code)
+            update_progress("Лайкеры", index - 1, len(codes), code)
+            if offline or (not args.refresh and (state["state"] == "complete" or (state["state"] == "partial" and not getattr(args, "retry_missing", False)))):
+                continue
+            if args.refresh:
+                store.reset(code)
+                state = store.state(code)
+            session._igdump_liker_resume_cursor = state.get("cursor") if state["state"] in ("failed", "collecting") else None
+            try:
+                users = fetch_all_likers(session, code, args.like_delay)
+                # Also supports callers that return records without page callbacks.
+                if users:
+                    store.add_page(code, users, None, None)
+                expected = store.state(code).get("expected")
+                counts = getattr(session, "_igdump_liker_counts", None)
+                if isinstance(counts, dict) and counts.get(code) is not None:
+                    expected = counts[code]
+                if code in post_counts:
+                    expected = max(post_counts[code], expected or 0)
+                partial = expected is not None and store.count(code) < expected
+                store.mark(code, "partial" if partial else "complete", expected)
+                if args.refresh:
+                    store.finish_refresh(code)
+                if partial:
+                    logger.warning("%s: собрано %s из %s. Для повторной проверки: --retry-missing", code, store.count(code), expected)
+            except (ExportError, requests.RequestException, ValueError) as exc:
+                if args.refresh:
+                    store.restore_refresh()
+                store.mark(code, "failed", error=str(exc))
+                failed.append(code)
+                logger.error("%s: %s. Полученные страницы сохранены.", code, exc)
+                if isinstance(exc, ExportError) and ("429" in str(exc) or "не разрешил" in str(exc)):
+                    args._rate_limited = True
+                    break
+        update_progress("Лайкеры", len(codes), len(codes), "пересчёт статистики")
+        states = [store.state(code) for code in codes]
+        complete = sum(state["state"] == "complete" for state in states)
+        partial = sum(state["state"] == "partial" for state in states)
+        pending = len(codes) - complete - partial
+        with (output_dir / "likers-coverage.csv").open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["post_shortcode", "state", "reported_likes", "collected_users", "missing", "error"])
+            for code, state in zip(codes, states):
+                expected = state.get("expected")
+                count = store.count(code)
+                writer.writerow([code, state["state"], expected if expected is not None else "", count,
+                                 max(0, expected-count) if expected is not None else "", state.get("error") or ""])
+        stats = store.stats()
+        _save_likers_csv(store.rows(), output_dir)
+        timeline = load_post_links(output_dir, username)
+        note = f"Complete lists: {complete}. Partial lists: {partial}. Unfinished posts: {pending}. "
+        if not timeline.get("completed"):
+            note += "The profile timeline is incomplete. "
+        note += "Only users returned by Instagram are counted; partial lists can be rechecked with --retry-missing."
+        write_interaction_report(args, output_dir, stats, note)
+        _save_debug_log(output_dir)
+        return 4 if not offline and (failed or partial or pending or not timeline.get("completed")) else 0
+    finally:
+        session._igdump_liker_page_callback = None
+        store.close()
+
+
+def export_cached_comments(args, output_dir, links):
+    records, completed = load_comment_cache(output_dir / ".comments.json", args.username)
+    codes = {parse_shortcode_from_url(url) for url in links}
+    records = [row for row in records if row.get("post_shortcode") in codes]
+    stats = aggregate_comment_stats(records, len(codes))
+    _save_comments_csv(records, output_dir)
+    write_interaction_report(args, output_dir, stats, f"Cached posts: {len(codes & completed)} of {len(codes)}. Offline recalculation; no network requests.")
+    return 0
+
+
+def run_full(args):
+    root = ensure_output_dir(args.output_dir, args)
+    phases = []
+    for mode, title, filename in (("full", "Posts", "index.html"), ("comments", "Commenters", "comments.html"), ("likers", "Likers", "likers.html")):
+        phase = argparse.Namespace(**vars(args))
+        phase.mode, phase.output_dir, phase.no_open = mode, str(root), True
+        # Reuse the timeline collected by the first phase rather than refreshing it three times.
+        try:
+            result = run(phase) if mode == "full" else run_comments(phase)
+            if getattr(phase, "_shared_session", None) is not None:
+                args._shared_session = phase._shared_session
+            if getattr(phase, "_selected_links", None) is not None:
+                args._selected_links = phase._selected_links
+        except (ExportError, requests.RequestException) as exc:
+            logger.error("%s: %s", title, exc)
+            result = 2
+        phases.append((title, filename, result))
+        if getattr(phase, "_rate_limited", False):
+            logger.warning("Остальные этапы отложены из-за ограничения Instagram. Повторите full позже.")
+            break
+        if args.dry_run:
+            return result
+    rows = []
+    for title, filename, result in phases:
+        label = f'<a href="{filename}">{title}</a>' if (root / filename).exists() else title
+        rows.append(f'<li>{label} — {"complete" if result == 0 else "partial or failed; see console and coverage"}</li>')
+    path = root / "full.html"
+    path.write_text('<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Full export</title><style>body{font:16px system-ui;margin:32px auto;padding:0 24px;max-width:960px}li{margin:16px 0}a{color:#c02e65}</style>' + f'<h1>Full export — @{escape(args.username)}</h1><ul>{"".join(rows)}</ul></html>', encoding="utf-8")
+    print(path.as_uri())
+    open_export(path, args)
+    return 4 if any(result for _, _, result in phases) else 0
+
+
+def _save_likers_csv(records, output_dir: Path) -> None:
     with (output_dir / "likers.csv").open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=["post_shortcode", "user_id", "username", "full_name"])
         writer.writeheader()
@@ -2191,16 +2343,19 @@ def _save_likers_csv(records: list[dict[str, Any]], output_dir: Path) -> None:
 
 def _save_participant_stats(stats: dict[str, Any], output_dir: Path, kind: str) -> None:
     is_likes = kind == "likers"
-    fields = ["username", "full_name", "likes_count" if is_likes else "comment_count", "posts_liked" if is_likes else "posts_commented"]
-    if not is_likes:
+    fields = ["username", "full_name", "likes_count" if is_likes else "comment_count", "posts_commented"]
+    if is_likes:
+        fields = fields[:3]
+    else:
         fields += ["likes_received", "last_comment_at"]
     with (output_dir / f"{kind}-stats.csv").open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for user in stats["participants"]:
             row = {"username": user["username"], "full_name": user["full_name"],
-                   fields[2]: user["count"], fields[3]: user["posts_commented"]}
+                   fields[2]: user["count"]}
             if not is_likes:
+                row["posts_commented"] = user["posts_commented"]
                 timestamp = user["last_comment_ts"]
                 row.update(likes_received=user["likes_received"], last_comment_at=datetime.fromtimestamp(timestamp, UTC).isoformat() if timestamp else "")
             writer.writerow(row)

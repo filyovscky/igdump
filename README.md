@@ -15,22 +15,25 @@ pip install -r requirements.txt
 
 ## Commands
 
-Choose one command: `all`, `oldest`, `comments`, or `likers`.
+Choose one command: `all`, `oldest`, `comments`, `likers`, or `full`.
 Usernames work with or without `@`.
 
 ```console
 # First 100 posts from the beginning of the profile, oldest first
-python insta_html_export.py oldest @kharlamova_alena --limit 100
+python insta_html_export.py oldest "@kharlamova_alena" --limit 100
 
 # All available posts, newest first
-python insta_html_export.py all @kharlamova_alena
+python insta_html_export.py all "@kharlamova_alena"
 
 # Commenters / likers of the 100 most recent posts
-python insta_html_export.py comments @kharlamova_alena --limit 100
-python insta_html_export.py likers @kharlamova_alena --limit 100
+python insta_html_export.py comments "@kharlamova_alena" --limit 100
+python insta_html_export.py likers "@kharlamova_alena" --limit 100
+
+# Posts, commenters and likers together
+python insta_html_export.py full "@kharlamova_alena" --limit 100
 ```
 
-`oldest` requires a positive `--limit`. For `comments` and `likers`,
+`oldest` requires a positive `--limit`. For `comments`, `likers`, and `full`,
 omitting `--limit` or using `--limit 0` selects all available posts.
 The script first collects the timeline to identify the earliest posts.
 Pinned posts may affect Instagram's ordering.
@@ -43,22 +46,22 @@ not by the date of a comment or like. The limit applies **after** filtering.
 
 ```console
 # From 1 January 2024 onward, including that day
-python insta_html_export.py all @kharlamova_alena --after 01.01.2024
+python insta_html_export.py all "@kharlamova_alena" --after 01.01.2024
 
 # Through 31 December 2024, including that day
-python insta_html_export.py all @kharlamova_alena --before 31.12.2024
+python insta_html_export.py all "@kharlamova_alena" --before 31.12.2024
 
 # First 100 posts within 2024
-python insta_html_export.py oldest @kharlamova_alena --limit 100 --after 01.01.2024 --before 31.12.2024
+python insta_html_export.py oldest "@kharlamova_alena" --limit 100 --after 01.01.2024 --before 31.12.2024
 ```
 
-The same filters work with `comments` and `likers`. Invalid dates and reversed
+The same filters work with `comments`, `likers`, and `full`. Invalid dates and reversed
 ranges are rejected. If a post's date cannot be determined, filtering stops
 with an explanation instead of silently skipping it. Dates are cached.
 
 ## Login and results
 
-For `all` / `oldest`, log into the Chrome window on first use and press Enter
+For `all` / `oldest` / `full`, log into the Chrome window on first use and press Enter
 in the terminal. The session is reused later.
 
 For `comments` / `likers`, the script can request your `sessionid` cookie:
@@ -72,7 +75,8 @@ limit and any date filters:
 |---|---|
 | `all` / `oldest` | `index.html`, local media |
 | `comments` | `comments.html`, `comments.csv`, `comments-stats.csv` |
-| `likers` | `likers.html`, `likers.csv`, `likers-stats.csv` |
+| `likers` | `likers.html`, `likers.csv`, `likers-stats.csv`, `likers-coverage.csv` |
+| `full` | All the above, with `full.html` linking to the reports |
 
 HTML opens automatically when collection finishes, including partial results.
 Console progress shows the current stage and counts. Completed posts are saved
@@ -81,21 +85,57 @@ caches are reused even when the total post count is unknown.
 
 Commenter statistics include comment count, posts commented on, likes received
 on comments and the latest collected comment date. Liker statistics include
-collected likes and posts liked per user. HTML shows the top users and posts;
-statistics CSVs include every collected user.
+collected likes per user. HTML shows the top users and posts;
+statistics CSVs include every collected user. Top-10 posts use saved Instagram
+like counters when available; old caches without counters use collected users
+and mark those figures explicitly.
 
 Instagram may limit access or return only part of a liker list; totals describe
 **collected accounts**, not a guarantee of all likes. Comment replies may not
 be included. Incomplete collection is reported. A `429` means rate limiting;
 wait before retrying. A missing avatar does not prevent an export.
 
+## Liker retries and resource use
+
+`likers` downloads no publications, photos, videos or avatars. It collects
+post links, then requests liker pages. Completed lists are cached. Network
+errors get at most two extra attempts; saved pages resume from their cursor.
+A `429` stops collection instead of retrying every remaining post.
+
+A counter of 43 with 42 returned users is a partial list, not a lost CSV row.
+The API may return fewer accessible accounts than its counter; rechecking
+can find missing users but cannot guarantee all 43. Inspect `likers-coverage.csv`.
+Partial lists are skipped by default; explicitly recheck them with:
+
+```console
+python insta_html_export.py likers "@kharlamova_alena" --retry-missing
+python insta_html_export.py likers "@kharlamova_alena" --offline
+```
+
+Use the same limit, dates and output folder as the original run. `--offline`
+rebuilds HTML/CSV from the cache with **zero HTTP requests** and no login.
+`comments` also supports it. `--refresh` recollects selected lists.
+
+Likers are saved per page in SQLite; old JSON caches migrate automatically
+and remain as backups. SQL counts the likes; CSV rows are streamed. Memory
+scales with a page and the number of unique users, rather than all likes.
+The first JSON migration temporarily loads the old file into memory.
+
+Request cost: profile/login checks + timeline pages + liker pages for selected
+uncached posts. Date filters may need a metadata request per uncached date.
+`full` reuses one session and one selected timeline across its three phases.
+In an interactive terminal, logs appear above a fixed bottom progress panel;
+redirected output uses plain, occasional progress lines.
+
 ## Options
 
 | Option | Purpose |
 |---|---|
 | `--after DD.MM.YYYY` / `--before DD.MM.YYYY` | Inclusive publication-date bounds |
-| `--download-videos` | Save videos for `all` / `oldest`; default: covers only |
+| `--download-videos` | Save videos for `all` / `oldest` / `full`; default: covers only |
 | `--refresh` | Recheck the timeline and update selected posts / interactions |
+| `--retry-missing` | Recheck partial liker lists and merge accounts without duplicates (`likers` / `full`) |
+| `--offline` | Rebuild interaction reports without network requests (`comments` / `likers`) |
 | `--no-open` | Do not open the finished HTML automatically |
 | `--output-dir "C:\Archives\instagram"` | Custom output folder |
 | `--dry-run` | Select and count posts without downloading media / interactions; needs Instagram access |

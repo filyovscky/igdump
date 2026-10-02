@@ -124,7 +124,7 @@ class LikerTests(unittest.TestCase):
                 rows = list(csv.DictReader(handle))
             self.assertEqual(rows[0]["username"], "alice")
             self.assertEqual(rows[0]["likes_count"], "2")
-            self.assertEqual(rows[0]["posts_liked"], "2")
+            self.assertNotIn("posts_liked", rows[0])
             self.assertEqual(len(rows), 2)
             self.assertFalse((root / "comments.html").exists())
 
