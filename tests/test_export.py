@@ -176,7 +176,7 @@ class ExportTests(unittest.TestCase):
             self.assertIn("02.01.2020", record["date_label"])
             payload.pop("_fallback_timestamp")
             record = app.build_post_record(MagicMock(), payload, Path(directory), 1, "https://www.instagram.com/p/A/")
-            self.assertEqual(record["date_label"], "Дата неизвестна")
+            self.assertEqual(record["date_label"], "Date unknown")
 
     def test_carousel_has_individual_video_types(self):
         image = {"media_type": 1, "image_versions2": {"candidates": [{"url": "photo.jpg"}]}}

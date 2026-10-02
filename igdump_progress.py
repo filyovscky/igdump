@@ -39,7 +39,7 @@ class TerminalUI(logging.Handler):
         self.started = time.monotonic()
         self.progress = Progress(SpinnerColumn(), TextColumn("[bold]{task.description}"), BarColumn(),
                                  TaskProgressColumn(), MofNCompleteColumn(), TimeElapsedColumn(), console=self.console)
-        self.task = self.progress.add_task("Подготовка", total=None)
+        self.task = self.progress.add_task("Preparing", total=None)
         self.layout = Layout()
         self.layout.split_column(Layout(name="logs", ratio=1), Layout(name="status", size=6))
         self.live = None
@@ -71,8 +71,8 @@ class TerminalUI(logging.Handler):
     def render(self):
         rows = max(1, self.console.size.height - 9)
         self.layout["logs"].update(Panel(Group(*list(self.logs)[-rows:]), title="igdump", border_style="dim", padding=(0,1)))
-        self.layout["status"].update(Panel(Group(self.progress, Text(f"HTTP-запросов: {self.requests}  •  сохранение прогресса включено", style="dim")),
-                                         title="Прогресс", border_style="cyan"))
+        self.layout["status"].update(Panel(Group(self.progress, Text(f"HTTP requests: {self.requests}  •  progress is saved", style="dim")),
+                                         title="Progress", border_style="cyan"))
 
     def update(self, stage, current, total=None, detail=""):
         self.progress.update(self.task, description=stage + (f" · {detail}" if detail else ""), total=total or None, completed=current)

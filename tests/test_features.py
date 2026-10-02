@@ -100,7 +100,7 @@ class LikerTests(unittest.TestCase):
 
     def test_liker_export_generates_html_rows_and_user_statistics(self):
         with tempfile.TemporaryDirectory() as directory:
-            args = app.parse_args(["likers", "natgeo", "--limit", "2", "--sessionid", "test", "--output-dir", directory])
+            args = app.parse_args(["likes", "natgeo", "--limit", "2", "--sessionid", "test", "--output-dir", directory])
             links = [f"https://www.instagram.com/p/{code}/" for code in "AB"]
             alice = {"pk": "1", "username": "alice", "full_name": "Alice"}
             bob = {"pk": "2", "username": "bob", "full_name": "Bob"}
@@ -119,8 +119,8 @@ class LikerTests(unittest.TestCase):
                 self.assertEqual(fetch.call_count, 2)
                 self.assertEqual(opener.call_count, 2)
             root = Path(directory)
-            self.assertIn("Top likers", (root / "likers.html").read_text(encoding="utf-8"))
-            with (root / "likers-stats.csv").open(encoding="utf-8-sig", newline="") as handle:
+            self.assertIn("Top users by likes", (root / "likes.html").read_text(encoding="utf-8"))
+            with (root / "likes-stats.csv").open(encoding="utf-8-sig", newline="") as handle:
                 rows = list(csv.DictReader(handle))
             self.assertEqual(rows[0]["username"], "alice")
             self.assertEqual(rows[0]["likes_count"], "2")

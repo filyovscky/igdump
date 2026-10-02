@@ -34,7 +34,7 @@ def load_comment_cache(path: Path, username: str) -> tuple[list[dict[str, Any]],
     payload = read_json(path)
     if not isinstance(payload, dict) or not isinstance(payload.get("username"), str) or payload["username"].lower() != username.lower():
         if payload:
-            logger.warning("Кеш данных без владельца или от другого профиля не используется; данные будут собраны заново.")
+            logger.warning("Cache ownership is missing or belongs to another profile; data will be collected again.")
         return [], set()
     records = payload.get("records", payload.get("comments", []))
     completed = payload.get("completed_posts", [])
@@ -64,7 +64,7 @@ class LikerStore:
         owner = self.db.execute("SELECT value FROM meta WHERE key='username'").fetchone()
         if owner and owner[0].lower() != username.lower():
             self.close()
-            raise ValueError("База лайкеров принадлежит другому профилю; выберите другую папку.")
+            raise ValueError("The likes database belongs to another profile; choose a different folder.")
         self.db.execute("INSERT OR IGNORE INTO meta VALUES('username',?)", (username,))
         self.db.execute("INSERT OR IGNORE INTO likes SELECT post,user_id FROM refresh_backup")
         self.db.execute("UPDATE posts SET state='failed' WHERE code IN (SELECT post FROM refresh_backup)")

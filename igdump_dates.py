@@ -9,11 +9,11 @@ from typing import Any
 
 def parse_date(value: str) -> date:
     if not re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", value):
-        raise argparse.ArgumentTypeError("Дата должна быть в формате ДД.ММ.ГГГГ, например 01.06.2024.")
+        raise argparse.ArgumentTypeError("Use DD.MM.YYYY, for example 01.06.2024.")
     try:
         return datetime.strptime(value, "%d.%m.%Y").date()
     except ValueError:
-        raise argparse.ArgumentTypeError("Такой даты не существует. Используйте ДД.ММ.ГГГГ.") from None
+        raise argparse.ArgumentTypeError("Invalid calendar date. Use DD.MM.YYYY.") from None
 
 
 def post_date(payload: dict[str, Any]) -> date | None:
@@ -39,7 +39,7 @@ def date_matches(value: date, after: date | None, before: date | None) -> bool:
 def date_label(after: date | None, before: date | None) -> str:
     parts = []
     if after:
-        parts.append(f"с {after:%d.%m.%Y}")
+        parts.append(f"from {after:%d.%m.%Y}")
     if before:
-        parts.append(f"по {before:%d.%m.%Y}")
+        parts.append(f"through {before:%d.%m.%Y}")
     return " ".join(parts)

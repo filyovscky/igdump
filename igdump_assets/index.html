@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -526,15 +526,15 @@
       <div class="feed-column">
         <div class="render-progress" id="render-progress"></div>
         <div id="feed"></div>
-        <div id="empty" class="empty-state" hidden>Посты не найдены.</div>
-        <div id="loader" class="loader">Загружаю следующую порцию…</div>
+        <div id="empty" class="empty-state" hidden>No posts found.</div>
+        <div id="loader" class="loader">Loading more posts…</div>
         <div id="sentinel"></div>
       </div>
     </section>
   </main>
 
-  <div id="lightbox" class="lightbox" role="dialog" aria-label="Просмотр изображения">
-    <button class="lightbox-close" id="lightbox-close" aria-label="Закрыть">&times;</button>
+  <div id="lightbox" class="lightbox" role="dialog" aria-label="Image viewer">
+    <button class="lightbox-close" id="lightbox-close" aria-label="Close">&times;</button>
     <img id="lightbox-img" src="" alt="">
   </div>
 
@@ -558,7 +558,7 @@
 
     const formatCaption = (caption) => {{
       if (!caption) {{
-        return '<div class="caption caption-empty">Без описания</div>';
+        return '<div class="caption caption-empty">No caption</div>';
       }}
       return `<div class="caption">${{escapeHtml(caption)}}</div>`;
     }};
@@ -568,7 +568,7 @@
         progress.textContent = "";
         return;
       }}
-      progress.textContent = `Показано ${{Math.min(cursor, posts.length)}} из ${{posts.length}} постов`;
+      progress.textContent = `Showing ${{Math.min(cursor, posts.length)}} of ${{posts.length}} posts`;
     }};
 
 
