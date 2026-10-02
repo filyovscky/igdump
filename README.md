@@ -15,27 +15,40 @@ pip install -r requirements.txt
 
 ## Commands
 
-Choose one command: `all`, `oldest`, `comments`, `likes`, or `full`.
-Usernames work with or without `@`.
+Commands choose what to collect: `posts`, `comments`, `likes`, or `full`.
+Options choose which posts to use. Usernames work with or without `@`.
+Install the `igdump` command with `pip install -e .`; alternatively, use
+`python insta_html_export.py` as shown below.
 
 ```console
 # First 100 posts from the beginning of the profile, oldest first
-python insta_html_export.py oldest "@kharlamova_alena" --limit 100
+python insta_html_export.py posts "@kharlamova_alena" --oldest --limit 100
+
+# Latest 100 posts
+python insta_html_export.py posts "@kharlamova_alena" --limit 100
 
 # All available posts, newest first
-python insta_html_export.py all "@kharlamova_alena"
+python insta_html_export.py posts "@kharlamova_alena"
 
 # Comments / users who liked the 100 most recent posts
 python insta_html_export.py comments "@kharlamova_alena" --limit 100
 python insta_html_export.py likes "@kharlamova_alena" --limit 100
 
-# Posts, comment statistics and like statistics together
-python insta_html_export.py full "@kharlamova_alena" --limit 100
+# Users who liked the earliest 100 posts
+python insta_html_export.py likes "@kharlamova_alena" --oldest --limit 100
+
+# Posts and both statistics for 2024
+python insta_html_export.py full "@kharlamova_alena" --after 01.01.2024 --before 31.12.2024
 ```
 
-`oldest` requires a positive `--limit`. For `comments`, `likes`, and `full`,
-omitting `--limit` or using `--limit 0` selects all available posts.
-The script first collects the timeline to identify the earliest posts.
+For every command, omitting `--limit` or using `--limit 0` selects all posts.
+`--limit N` selects the latest N; `--oldest --limit N` selects the earliest N.
+`--oldest` without a limit selects all posts, oldest first. Dates apply before the limit.
+The earliest selection requires a complete timeline; if collection is incomplete,
+the script saves progress and stops so that a later run can resume.
+Legacy commands remain supported: `all` means `posts`, `oldest --limit N` means
+`posts --oldest --limit N` (a positive limit is still required), and `likers` means `likes`.
+Matching old cache folders are reused automatically.
 Pinned posts may affect Instagram's ordering.
 
 ## Date filters
@@ -46,13 +59,13 @@ not by the date of a comment or like. The limit applies **after** filtering.
 
 ```console
 # From 1 January 2024 onward, including that day
-python insta_html_export.py all "@kharlamova_alena" --after 01.01.2024
+python insta_html_export.py posts "@kharlamova_alena" --after 01.01.2024
 
 # Through 31 December 2024, including that day
-python insta_html_export.py all "@kharlamova_alena" --before 31.12.2024
+python insta_html_export.py posts "@kharlamova_alena" --before 31.12.2024
 
 # First 100 posts within 2024
-python insta_html_export.py oldest "@kharlamova_alena" --limit 100 --after 01.01.2024 --before 31.12.2024
+python insta_html_export.py posts "@kharlamova_alena" --oldest --limit 100 --after 01.01.2024 --before 31.12.2024
 ```
 
 The same filters work with `comments`, `likes`, and `full`. Invalid dates and reversed
@@ -61,7 +74,7 @@ with an explanation instead of silently skipping it. Dates are cached.
 
 ## Login and results
 
-For `all` / `oldest` / `full`, log into the Chrome window on first use and press Enter
+For `posts` / `full`, log into the Chrome window on first use and press Enter
 in the terminal. The session is reused later.
 
 For `comments` / `likes`, the script can request your `sessionid` cookie:
@@ -69,11 +82,11 @@ Chrome → F12 → Application → Cookies → instagram.com → sessionid.
 It is saved locally in `~/.insta-export/config.json`.
 
 Results are saved under `exports/`, in a folder named for the profile, command,
-limit and any date filters:
+limit, `--oldest` selection and any date filters:
 
 | Command | Files |
 |---|---|
-| `all` / `oldest` | `index.html`, local media |
+| `posts` | `index.html`, local media |
 | `comments` | `comments.html`, `comments.csv`, `comments-stats.csv` |
 | `likes` | `likes.html`, `likes.csv`, `likes-stats.csv`, `likes-coverage.csv` |
 | `full` | All the above, with `full.html` linking to the reports |
@@ -129,7 +142,7 @@ cache folders and the previous command spelling remain compatible.
 Request cost: profile/login checks + timeline pages + pages of users who liked posts for selected
 uncached or incomplete posts, plus one recheck for newly incomplete lists.
 Date filters may need a metadata request per uncached date.
-`full` reuses one session and one selected timeline across its three phases.
+`full` reuses the Chrome session and one selected timeline across its three phases.
 In an interactive terminal, logs appear above a fixed bottom progress panel;
 redirected output uses plain, occasional progress lines.
 
@@ -137,14 +150,19 @@ redirected output uses plain, occasional progress lines.
 
 | Option | Purpose |
 |---|---|
+| `--limit N` | Latest N posts after date filtering; omitted or 0 = all |
+| `--oldest` | Earliest posts, oldest first; works with every command |
 | `--after DD.MM.YYYY` / `--before DD.MM.YYYY` | Inclusive publication-date bounds |
-| `--download-videos` | Save videos for `all` / `oldest` / `full`; default: covers only |
+| `--download-videos` | Save videos for `posts` / `full`; default: covers only |
 | `--refresh` | Recheck the timeline and update selected posts / interactions |
 | `--offline` | Rebuild interaction reports without network requests (`comments` / `likes`) |
 | `--no-open` | Do not open the finished HTML automatically |
 | `--output-dir "C:\Archives\instagram"` | Custom output folder |
 | `--dry-run` | Select and count posts without downloading media / interactions; needs Instagram access |
-| `--headful` | Keep Chrome visible during post export |
+| `--headful` | Keep Chrome visible during post export (`posts` / `full`) |
+| `--batch-size N` | Cards per scroll batch in the HTML archive (`posts` / `full`, default: 9); does not change API requests |
+| `--browser-profile-dir PATH` | Saved Chrome profile for login |
+| `--sessionid COOKIE` | Session cookie for `comments` / `likes`; saved sessions are reused |
 | `--comment-delay 3` / `--like-delay 3` | Request delay in seconds for the corresponding command (default: 2) |
 | `--verbose` / `--quiet` | Detailed / minimal console output |
 | `--help` | Command help, e.g. `python insta_html_export.py likes --help` |

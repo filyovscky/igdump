@@ -44,6 +44,18 @@ class DateTests(unittest.TestCase):
             self.assertEqual(app.filter_links_by_date(links, args, session, Path(directory)), filtered)
             fetch.assert_not_called()
 
+    def test_date_selection_precedes_limit_for_every_content_command(self):
+        links = [f"https://www.instagram.com/p/{code}/" for code in "ABCD"]
+        session = requests.Session()
+        # Include a pinned older post before the newer posts.
+        session._igdump_post_dates = {"A": "2023-01-01", "B": "2025-01-01", "C": "2024-12-31", "D": "2024-01-01"}
+        for mode in ("posts", "comments", "likes", "full"):
+            for flags, expected in (([], [links[2]]), (["--oldest"], [links[3]])):
+                args = app.parse_args([mode, "natgeo", "--limit", "1", "--after", "01.01.2024", "--before", "31.12.2024", *flags])
+                with self.subTest(mode=mode, flags=flags), tempfile.TemporaryDirectory() as directory:
+                    filtered = app.filter_links_by_date(links, args, session, Path(directory))
+                    self.assertEqual(app.select_post_links(filtered, args), expected)
+
     def test_date_cache_survives_failure_and_resume(self):
         args = app.parse_args(["all", "natgeo", "--after", "01.01.2024"])
         links = [f"https://www.instagram.com/p/{code}/" for code in "AB"]

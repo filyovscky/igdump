@@ -15,27 +15,40 @@ pip install -r requirements.txt
 
 ## Команды
 
-Выберите одну: `all`, `oldest`, `comments`, `likes` или `full`.
-Имя профиля принимается с `@` или без.
+Команда выбирает содержимое: `posts`, `comments`, `likes` или `full`.
+Опции выбирают публикации. Имя профиля принимается с `@` или без.
+Для установки команды `igdump` выполните `pip install -e .`; также можно
+запускать `python insta_html_export.py`, как в примерах ниже.
 
 ```console
 # Первые 100 постов с начала истории профиля, ранние сверху
-python insta_html_export.py oldest "@kharlamova_alena" --limit 100
+python insta_html_export.py posts "@kharlamova_alena" --oldest --limit 100
+
+# Последние 100 постов
+python insta_html_export.py posts "@kharlamova_alena" --limit 100
 
 # Все доступные посты, новые сверху
-python insta_html_export.py all "@kharlamova_alena"
+python insta_html_export.py posts "@kharlamova_alena"
 
 # Комментарии / пользователи, поставившие лайк 100 последних постов
 python insta_html_export.py comments "@kharlamova_alena" --limit 100
 python insta_html_export.py likes "@kharlamova_alena" --limit 100
 
-# Посты и обе статистики вместе
-python insta_html_export.py full "@kharlamova_alena" --limit 100
+# Пользователи, поставившие лайк первым 100 постам
+python insta_html_export.py likes "@kharlamova_alena" --oldest --limit 100
+
+# Посты и обе статистики за 2024 год
+python insta_html_export.py full "@kharlamova_alena" --after 01.01.2024 --before 31.12.2024
 ```
 
-В `oldest` лимит обязателен и больше нуля. В `comments`, `likes` и `full`
-отсутствие лимита или `--limit 0` означает все доступные посты.
-Для поиска первых постов скрипт проходит список публикаций до конца.
+Для всех команд отсутствие лимита или `--limit 0` означает все посты.
+`--limit N` выбирает последние N; `--oldest --limit N` — первые N.
+`--oldest` без лимита выбирает все посты, ранние сверху. Даты применяются перед лимитом.
+Для поиска первых постов нужен полный список публикаций. Если сбор списка
+не завершён, скрипт сохраняет прогресс и останавливается; повтор продолжит сбор.
+Старые команды поддерживаются: `all` означает `posts`, `oldest --limit N` —
+`posts --oldest --limit N` (положительный лимит по-прежнему обязателен),
+`likers` — `likes`. Подходящие старые папки кеша подхватываются автоматически.
 Закреплённые посты могут влиять на порядок списка Instagram.
 
 ## Даты
@@ -46,13 +59,13 @@ python insta_html_export.py full "@kharlamova_alena" --limit 100
 
 ```console
 # С 1 января 2024 года включительно и дальше
-python insta_html_export.py all "@kharlamova_alena" --after 01.01.2024
+python insta_html_export.py posts "@kharlamova_alena" --after 01.01.2024
 
 # По 31 декабря 2024 года включительно
-python insta_html_export.py all "@kharlamova_alena" --before 31.12.2024
+python insta_html_export.py posts "@kharlamova_alena" --before 31.12.2024
 
 # Первые 100 постов внутри 2024 года
-python insta_html_export.py oldest "@kharlamova_alena" --limit 100 --after 01.01.2024 --before 31.12.2024
+python insta_html_export.py posts "@kharlamova_alena" --oldest --limit 100 --after 01.01.2024 --before 31.12.2024
 ```
 
 Эти флаги работают также с `comments`, `likes` и `full`. Ошибочные даты и обратный
@@ -62,7 +75,7 @@ python insta_html_export.py oldest "@kharlamova_alena" --limit 100 --after 01.01
 
 ## Вход и результат
 
-При первом запуске `all` / `oldest` / `full` войдите в открывшемся Chrome и нажмите
+При первом запуске `posts` / `full` войдите в открывшемся Chrome и нажмите
 Enter в терминале. Сессия сохранится для следующих запусков.
 
 Для `comments` / `likes` скрипт может запросить cookie `sessionid`:
@@ -70,11 +83,11 @@ Chrome → F12 → Application → Cookies → instagram.com → sessionid.
 Она сохраняется локально в `~/.insta-export/config.json`.
 
 Результаты лежат в `exports/`, в папке с именем профиля, командой,
-лимитом и фильтрами дат:
+лимитом, признаком `--oldest` и фильтрами дат:
 
 | Команда | Файлы |
 |---|---|
-| `all` / `oldest` | `index.html`, локальные медиа |
+| `posts` | `index.html`, локальные медиа |
 | `comments` | `comments.html`, `comments.csv`, `comments-stats.csv` |
 | `likes` | `likes.html`, `likes.csv`, `likes-stats.csv`, `likes-coverage.csv` |
 | `full` | Все эти файлы и общая страница `full.html` |
@@ -129,7 +142,7 @@ HTML/CSV из кеша: **без входа и запросов к сети**. �
 
 Запросы: проверка входа/профиля + страницы списка постов + страницы пользователей, поставивших лайк
 необработанным или неполным постам, плюс одна проверка новых неполных списков. Отбор по датам может потребовать запрос на каждый пост
-без сохранённой даты. `full` использует одну сессию и один отобранный список.
+без сохранённой даты. `full` использует сессию Chrome и один отобранный список.
 В обычном терминале прогресс закреплён внизу, логи — сверху. При перенаправлении
 вывода в файл остаются редкие текстовые строки прогресса.
 
@@ -137,14 +150,19 @@ HTML/CSV из кеша: **без входа и запросов к сети**. �
 
 | Флаг | Что делает |
 |---|---|
+| `--limit N` | Последние N постов после отбора по датам; без лимита или 0 — все |
+| `--oldest` | Первые посты, ранние сверху; работает для всех команд |
 | `--after ДД.ММ.ГГГГ` / `--before ДД.ММ.ГГГГ` | Границы дат публикации, включительно |
-| `--download-videos` | Скачивает видео для `all` / `oldest` / `full`; без флага — только обложки |
+| `--download-videos` | Скачивает видео для `posts` / `full`; без флага — только обложки |
 | `--refresh` | Заново проверяет список постов и обновляет выбранные публикации / комментарии / пользователей, поставивших лайк |
 | `--offline` | Пересчитывает отчёты из кеша без сети (`comments` / `likes`) |
 | `--no-open` | Не открывает HTML автоматически |
 | `--output-dir "C:\Archives\instagram"` | Своя папка результата |
 | `--dry-run` | Отбирает и считает посты без загрузки медиа / комментариев / пользователей, поставивших лайк; требует доступа к Instagram |
-| `--headful` | Оставляет Chrome видимым при выгрузке постов |
+| `--headful` | Оставляет Chrome видимым при выгрузке постов (`posts` / `full`) |
+| `--batch-size N` | Карточки на порцию прокрутки HTML-архива (`posts` / `full`, по умолчанию 9); не меняет запросы API |
+| `--browser-profile-dir PATH` | Сохранённый профиль Chrome для входа |
+| `--sessionid COOKIE` | Cookie сессии для `comments` / `likes`; сохранённая сессия используется автоматически |
 | `--comment-delay 3` / `--like-delay 3` | Задержка запросов соответствующей команды в секундах (по умолчанию 2) |
 | `--verbose` / `--quiet` | Подробный / минимальный вывод |
 | `--help` | Справка, например `python insta_html_export.py likes --help` |

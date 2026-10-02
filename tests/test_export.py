@@ -12,6 +12,55 @@ import insta_html_export as app
 
 
 class CommandTests(unittest.TestCase):
+    def test_selection_is_shared_by_all_content_commands(self):
+        links = ["new", "middle", "old"]
+        for mode in ("posts", "comments", "likes", "full"):
+            for flags, expected in (
+                ([], links), (["--limit", "0"], links),
+                (["--limit", "2"], links[:2]),
+                (["--oldest", "--limit", "2"], ["old", "middle"]),
+                (["--oldest"], list(reversed(links))),
+                (["--oldest", "--limit", "10"], list(reversed(links))),
+            ):
+                with self.subTest(mode=mode, flags=flags):
+                    args = app.parse_args([mode, "@natgeo", *flags])
+                    self.assertEqual(app.select_post_links(links, args), expected)
+
+    def test_legacy_commands_match_new_commands(self):
+        for old, new in (
+            (["all", "natgeo"], ["posts", "natgeo"]),
+            (["oldest", "natgeo", "--limit", "2"], ["posts", "natgeo", "--oldest", "--limit", "2"]),
+            (["likers", "natgeo"], ["likes", "natgeo"]),
+        ):
+            self.assertEqual(vars(app.parse_args(old)), vars(app.parse_args(new)))
+
+    def test_help_and_parser_expose_only_used_options(self):
+        for mode in ("posts", "comments", "likes", "full"):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+                app.parse_args([mode, "--help"])
+            for flag, supported in (
+                ("--batch-size", mode in ("posts", "full")),
+                ("--headful", mode in ("posts", "full")),
+                ("--download-videos", mode in ("posts", "full")),
+                ("--sessionid", mode in ("comments", "likes")),
+                ("--comment-delay", mode in ("comments", "full")),
+                ("--like-delay", mode in ("likes", "full")),
+                ("--offline", mode in ("comments", "likes")),
+            ):
+                with self.subTest(mode=mode, flag=flag):
+                    self.assertEqual(flag in out.getvalue(), supported)
+                    if not supported:
+                        value = [] if flag in ("--headful", "--download-videos", "--offline") else ["1"]
+                        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                            app.parse_args([mode, "natgeo", flag, *value])
+
+    def test_offline_rejects_options_requiring_network(self):
+        for mode in ("comments", "likes"):
+            for flag in ("--refresh", "--dry-run"):
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    app.parse_args([mode, "natgeo", "--offline", flag])
+
     def test_first_100_posts_and_at_username(self):
         args = app.parse_args(["oldest", "@kharlamova_alena", "--limit", "100"])
         self.assertEqual(args.username, "kharlamova_alena")
@@ -44,14 +93,67 @@ class CommandTests(unittest.TestCase):
                 self.assertEqual(error.exception.code, 2)
 
     def test_help_has_copyable_example(self):
-        for argv in (["--help"], ["oldest", "--help"]):
+        for argv in (["--help"], ["posts", "--help"], ["oldest", "--help"]):
             out = io.StringIO()
             with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
                 app.parse_args(argv)
-            self.assertIn("oldest @kharlamova_alena --limit 100", out.getvalue())
+            self.assertIn("posts @kharlamova_alena --oldest --limit 100", out.getvalue())
 
 
 class ExportTests(unittest.TestCase):
+    def test_oldest_has_separate_folder_and_export_state(self):
+        for mode in ("posts", "comments", "likes", "full"):
+            recent = app.parse_args([mode, "natgeo", "--limit", "2"])
+            oldest = app.parse_args([mode, "natgeo", "--limit", "2", "--oldest"])
+            self.assertNotEqual(app.build_job_slug(recent), app.build_job_slug(oldest))
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                app.save_export_state(root, recent, {}, None, [], True)
+                self.assertEqual(app.load_export_state(root, oldest), {})
+                self.assertTrue(app.load_export_state(root, recent)["completed"])
+
+    def test_posts_reuses_legacy_folders_and_export_states(self):
+        for legacy_mode, limit, oldest in (("all", None, False), ("oldest", 2, True)):
+            flags = ["--limit", str(limit), "--oldest"] if oldest else []
+            args = app.parse_args(["posts", "natgeo", "--after", "01.01.2024", *flags])
+            with tempfile.TemporaryDirectory() as directory, patch.object(app.Path, "cwd", return_value=Path(directory)):
+                suffix = "all" if limit is None else f"oldest-{limit}"
+                root = Path(directory) / "exports" / f"natgeo-{suffix}-after-2024-01-01"
+                root.mkdir(parents=True)
+                app.write_json(root / ".export-state.json", {
+                    "version": 3, "job": {"username": "natgeo", "mode": legacy_mode,
+                    "limit": limit, "after": "2024-01-01", "before": None},
+                    "post_records": [{"shortcode": "A"}], "completed": True,
+                })
+                self.assertEqual(app.ensure_output_dir(None, args), root.resolve())
+                self.assertEqual(app.load_export_state(root, args)["post_records"], [{"shortcode": "A"}])
+                app.save_export_state(root, args, {}, None, [{"shortcode": "A"}], True)
+                self.assertTrue(app.load_export_state(root, args)["completed"])
+
+    def test_oldest_does_not_reuse_latest_likers_folder(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(app.Path, "cwd", return_value=Path(directory)):
+            root = Path(directory) / "exports" / "natgeo-likers-2"
+            root.mkdir(parents=True)
+            args = app.parse_args(["likes", "natgeo", "--limit", "2"])
+            self.assertEqual(app.ensure_output_dir(None, args), root.resolve())
+            args.oldest = True
+            self.assertNotEqual(app.ensure_output_dir(None, args), root.resolve())
+
+    def test_every_oldest_command_rejects_incomplete_timeline(self):
+        for mode in ("posts", "comments", "likes", "full"):
+            args = app.parse_args([mode, "natgeo", "--oldest", "--limit", "2"])
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaises(app.ExportError):
+                    app.collect_post_links(MagicMock(), "natgeo", 100, Path(directory), args, ["new"], None, "1")
+
+    def test_offline_oldest_requires_complete_timeline(self):
+        for mode in ("comments", "likes"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                args = app.parse_args([mode, "natgeo", "--oldest", "--offline", "--output-dir", directory])
+                app.save_post_links(Path(directory), args, ["new"], 100, False)
+                with patch.object(requests.Session, "request", side_effect=AssertionError("network")), self.assertRaisesRegex(app.ExportError, "incomplete"):
+                    app.run_comments(args)
+
     def setUp(self):
         opener = patch.object(app.webbrowser, "open", return_value=True)
         self.browser_open = opener.start()

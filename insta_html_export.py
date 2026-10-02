@@ -287,149 +287,95 @@ def nonnegative_delay(value: str) -> float:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Export Instagram to a local HTML archive. Choose one command: all, oldest, comments, likes or full.",
+        description="Export Instagram posts, comments, likes or everything together.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
-  python insta_html_export.py all @kharlamova_alena
-      All available posts, newest first.
-  python insta_html_export.py oldest @kharlamova_alena --limit 100
+  igdump posts @kharlamova_alena
+      All posts, newest first.
+  igdump posts @kharlamova_alena --limit 100
+      The most recent 100 posts.
+  igdump posts @kharlamova_alena --oldest --limit 100
       The first 100 posts from the beginning of the profile, oldest first.
-  python insta_html_export.py comments @kharlamova_alena --limit 100
-      Comments on the 100 most recent posts (0 or no --limit = all).
-  python insta_html_export.py likes @kharlamova_alena --after 01.01.2024 --before 31.12.2024
-      Users who liked posts published in 2024, with participation statistics.
-  python insta_html_export.py full @kharlamova_alena --limit 100
-      Posts, comment statistics and like statistics in one folder.
+  igdump likes @kharlamova_alena --oldest --limit 100
+      Users who liked the first 100 posts, with participation statistics.
+  igdump full @kharlamova_alena --after 01.01.2024 --before 31.12.2024
+      Posts and both statistics for the specified date range.
 
-all and oldest are separate commands: choose one.
-Specify the post count as --limit 100, not as a positional argument.
-Usernames work with or without @. Quote @usernames in PowerShell.
-Command help: python insta_html_export.py oldest --help
-
-oldest scans the entire timeline before downloading the selected first N posts.
---after/--before use DD.MM.YYYY, include both days, and apply before --limit.
-all/oldest produce index.html and local media; comments/likes produce HTML and CSV.
-Incomplete lists of users who liked a post are automatically rechecked once.
+Commands choose what to collect. Options choose which posts to use.
+No --limit (or --limit 0) means all posts. --oldest selects earliest posts.
+Dates include both boundary days and apply before --limit.
+--oldest requires the complete timeline; incomplete timelines stop selection.
+Quote @usernames in PowerShell. The @ prefix is optional.
+Without the installed command, use: python insta_html_export.py posts USERNAME
+Command help: igdump posts --help
+Legacy post commands: all = posts; oldest = posts --oldest --limit N.
 """,
     )
     parser.add_argument("--version", action="version", version=f"igdump {VERSION}")
+    parser.set_defaults(batch_size=9, headful=False, download_videos=False,
+                        sessionid=None, comment_delay=2.0, like_delay=2.0,
+                        offline=False, retry_missing=False)
     subparsers = parser.add_subparsers(dest="mode", required=True)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("username", type=instagram_username, metavar="USERNAME", help="Instagram username, with or without @.")
+    common.add_argument("--limit", type=nonnegative_int, default=0, metavar="N",
+                        help="Maximum number of posts after date filters (0 or omitted = all). Latest posts by default; earliest with --oldest. This limits posts, not comments or users.")
+    common.add_argument("--oldest", action="store_true", help="Select earliest posts and show them oldest first. Without a limit, show all selected posts oldest first.")
+    common.add_argument("--after", type=parse_date, metavar="DD.MM.YYYY", help="Posts published on or after this day, in your computer's local time zone.")
+    common.add_argument("--before", type=parse_date, metavar="DD.MM.YYYY", help="Posts published on or before this day. Combine with --after for an inclusive date range.")
+    common.add_argument("--output-dir", default=None, help="Output folder (default: exports/<username>-<command>-<limit> with selection suffixes). Previous matching cache folders are reused.")
+    common.add_argument("--refresh", action="store_true", help="Recheck the timeline and replace selected cached data. Normal runs resume unfinished work.")
+    common.add_argument("--dry-run", action="store_true", help="Cache the timeline and report the selected post count without collecting media, comments or likes. Requires Instagram access.")
+    common.add_argument("--no-open", action="store_true", help="Do not open the finished HTML automatically.")
+    common.add_argument("--browser-profile-dir", default=str(DEFAULT_PROFILE_DIR), help="Saved Chrome profile used for Instagram login (default: ~/.insta-export/chrome-profile).")
+    verbosity = common.add_mutually_exclusive_group()
+    verbosity.add_argument("--verbose", action="store_true", help="Show detailed debug logs.")
+    verbosity.add_argument("--quiet", action="store_true", help="Show only warnings and errors.")
 
-    common_parent = argparse.ArgumentParser(add_help=False)
-    common_parent.add_argument("username", type=instagram_username, metavar="USERNAME", help="Username with or without @, such as @kharlamova_alena or natgeo.")
-    common_parent.add_argument("--refresh", action="store_true", help="Refresh the timeline and selected posts, comments and likes.")
-    common_parent.add_argument("--no-open", action="store_true", help="Do not open the finished HTML in your browser.")
-    common_parent.add_argument("--after", type=parse_date, metavar="DD.MM.YYYY", help="Posts published on or after this day, in your computer's local time zone.")
-    common_parent.add_argument("--before", type=parse_date, metavar="DD.MM.YYYY", help="Posts published on or before this day. Combine with --after for a date range; --limit applies after filtering.")
-    common_parent.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Cache post links, report the selection count, and exit without collecting media or interactions. Requires Instagram access.",
-    )
-    common_parent.add_argument(
-        "--output-dir",
-        default=None,
-        help="Output folder. Default: ./exports/<username>-<command>[-<limit>][-date filters].",
-    )
-    common_parent.add_argument(
-        "--batch-size",
-        type=positive_int,
-        default=9,
-        help="Number of cards loaded per scroll batch in the HTML archive (default: 9).",
-    )
-    common_parent.add_argument(
-        "--browser-profile-dir",
-        default=str(DEFAULT_PROFILE_DIR),
-        help="Saved Chrome profile for the Instagram session (default: ~/.insta-export/chrome-profile).",
-    )
-    common_parent.add_argument(
-        "--headful",
-        action="store_true",
-        help="Keep Chrome visible throughout collection.",
-    )
-    verbosity = common_parent.add_mutually_exclusive_group()
-    verbosity.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Show detailed debug logs.",
-    )
-    verbosity.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Show only warnings and errors.",
-    )
+    posts = subparsers.add_parser("posts", parents=[common],
+        help="Export selected posts with local photos and video covers.",
+        description="Selected posts in index.html with local media. Choose posts using --limit, --oldest and date filters.",
+        epilog="Example: igdump posts @kharlamova_alena --oldest --limit 100")
+    comments = subparsers.add_parser("comments", parents=[common],
+        help="Collect comments and participation statistics.",
+        description="Comments on selected posts: comments.html, comments.csv and comments-stats.csv. No post media downloads.")
+    likes = subparsers.add_parser("likes", parents=[common],
+        help="Collect users who liked posts and participation statistics.",
+        description="Users who liked selected posts: likes.html, likes.csv and likes-stats.csv. No post media downloads. Incomplete lists are automatically rechecked once.")
+    full = subparsers.add_parser("full", parents=[common],
+        help="Export posts and both participation statistics.",
+        description="Posts, comments and users who liked the same selected posts. All phases use the Chrome session. full.html links to the three reports and opens after collection.")
+    for command in (posts, full):
+        command.add_argument("--download-videos", action="store_true", help="Download videos; by default, save only photos and video covers.")
+        command.add_argument("--batch-size", type=positive_int, default=9, metavar="N", help="Cards loaded per scroll batch in the post archive (default: 9). Does not change request batching.")
+        command.add_argument("--headful", action="store_true", help="Keep Chrome visible throughout post collection.")
+    for command in (comments, likes):
+        command.add_argument("--sessionid", default=None, help="Instagram sessionid cookie for collection without Chrome. A saved session is used automatically.")
+    for command in (comments, full):
+        command.add_argument("--comment-delay", type=nonnegative_delay, default=2.0, metavar="SECONDS", help="Delay between comment requests (default: 2 seconds).")
+    for command in (likes, full):
+        command.add_argument("--like-delay", type=nonnegative_delay, default=2.0, metavar="SECONDS", help="Delay between like-list requests, including automatic rechecks (default: 2 seconds).")
+        command.add_argument("--retry-missing", action="store_true", help=argparse.SUPPRESS)
+    for command in (comments, likes):
+        command.add_argument("--offline", action="store_true", help="Rebuild HTML and CSV from the original collection folder without login or HTTP requests. Keep the same selection or specify --output-dir.")
 
-    all_parser = subparsers.add_parser(
-        "all",
-        parents=[common_parent],
-        help="Export all available posts, newest first in Instagram's order.",
-        description="All available posts in index.html with local media, newest first in Instagram's order.",
-        epilog="Example: python insta_html_export.py all @kharlamova_alena",
-    )
-
-    oldest = subparsers.add_parser(
-        "oldest",
-        parents=[common_parent],
-        help="Export the first N posts from the beginning of the profile, oldest first.",
-        description="The first N posts from the beginning of the profile, oldest first. Scan the full timeline, then download media for the selected N posts.",
-        epilog="Example: python insta_html_export.py oldest @kharlamova_alena --limit 100",
-    )
-    oldest.add_argument("--limit", type=positive_int, required=True, metavar="N", help="Number of earliest posts (greater than 0). If fewer posts exist, export all available posts.")
-    for post_parser in (all_parser, oldest):
-        post_parser.add_argument("--download-videos", action="store_true", help="Download videos. By default, save only photos and video covers.")
-
-    comments_parser = subparsers.add_parser(
-        "comments",
-        parents=[common_parent],
-        help="Collect comments and statistics for people who commented.",
-        description="Comments in comments.html and comments.csv. --limit N selects the most recent N posts; no limit selects all posts.",
-        epilog="Example: python insta_html_export.py comments @kharlamova_alena --limit 100",
-    )
-    comments_parser.add_argument(
-        "--limit",
-        type=nonnegative_int,
-        default=0,
-        help="Number of most recent posts to collect comments from (0 = all).",
-    )
-    comments_parser.add_argument(
-        "--comment-delay",
-        type=nonnegative_delay,
-        default=2.0,
-        help="Delay in seconds between comment requests. "
-        "A larger delay reduces request frequency (default: 2).",
-    )
-    comments_parser.add_argument(
-        "--sessionid",
-        default=None,
-        help="Instagram sessionid cookie from Chrome (F12 > Application > Cookies > sessionid). "
-        "Allows interaction collection without Playwright or Chrome.",
-    )
-    likers_parser = subparsers.add_parser("likes", parents=[common_parent],
-        help="Collect users who liked posts and their participation statistics.",
-        description="Users who liked selected posts: likes.html, likes.csv and likes-stats.csv. Date filters select publication dates.")
-    likers_parser.add_argument("--limit", type=nonnegative_int, default=0, help="Most recent N posts after date filtering (0 = all).")
-    likers_parser.add_argument("--like-delay", type=nonnegative_delay, default=2.0, help="Delay in seconds between like-list requests (default: 2).")
-    likers_parser.add_argument("--sessionid", default=None, help="Instagram sessionid; the saved session is reused automatically.")
-    for interaction_parser in (comments_parser, likers_parser):
-        interaction_parser.add_argument("--offline", action="store_true", help="Rebuild HTML and CSV from the cache without login or HTTP requests.")
-    likers_parser.add_argument("--retry-missing", action="store_true", help=argparse.SUPPRESS)
-    full_parser = subparsers.add_parser("full", parents=[common_parent], help="Posts, comment statistics and like statistics in one folder with a summary report.")
-    full_parser.add_argument("--limit", type=nonnegative_int, default=0, help="Most recent N posts after date filtering (0 = all).")
-    full_parser.add_argument("--download-videos", action="store_true", help="Download videos; by default, save video covers only.")
-    full_parser.add_argument("--sessionid", default=None)
-    full_parser.add_argument("--comment-delay", type=nonnegative_delay, default=2.0)
-    full_parser.add_argument("--like-delay", type=nonnegative_delay, default=2.0)
-    full_parser.add_argument("--retry-missing", action="store_true", help=argparse.SUPPRESS)
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if arguments and arguments[0] == "likers":
-        arguments[0] = "likes"
     if arguments[:2] == ["all", "oldest"]:
-        parser.error("all and oldest are separate commands. For the first 100 posts: python insta_html_export.py oldest @kharlamova_alena --limit 100")
+        parser.error("Choose one command. For the first 100 posts: igdump posts @kharlamova_alena --oldest --limit 100")
+    legacy = arguments[0] if arguments else None
+    if legacy in ("all", "oldest"):
+        arguments[0] = "posts"
+        if legacy == "oldest":
+            arguments.append("--oldest")
+    elif legacy == "likers":
+        arguments[0] = "likes"
     parsed = parser.parse_args(arguments)
+    if legacy == "oldest" and parsed.limit <= 0:
+        parser.error("The legacy oldest command requires --limit N greater than 0. Use posts --oldest for an unlimited selection.")
     if parsed.after and parsed.before and parsed.after > parsed.before:
         parser.error("--after must not be later than --before.")
-    if getattr(parsed, "offline", False) and (parsed.refresh or getattr(parsed, "retry_missing", False)):
-        parser.error("--offline cannot be combined with --refresh or --retry-missing.")
+    if parsed.offline and (parsed.refresh or parsed.dry_run or parsed.retry_missing):
+        parser.error("--offline cannot be combined with --refresh, --dry-run or --retry-missing.")
     return parsed
 
 
@@ -443,6 +389,8 @@ def build_job_slug(args: argparse.Namespace) -> str:
     else:
         limit = getattr(args, "limit", 0)
         slug = f"{safe_slug(args.username)}-{args.mode}-{limit}"
+    if getattr(args, "oldest", False) and args.mode != "oldest":
+        slug += "-oldest"
     for name in ("after", "before"):
         value = getattr(args, name, None)
         if value:
@@ -461,14 +409,22 @@ def ensure_output_dir(base: str | None, args: argparse.Namespace) -> Path:
         root = Path(base).expanduser().resolve()
     else:
         root = (Path.cwd() / "exports" / build_job_slug(args)).resolve()
-        if args.mode == "likes" and not root.exists():
+        legacy_mode = None
+        if args.mode == "posts":
+            if args.oldest and args.limit:
+                legacy_mode = "oldest"
+            elif not args.oldest and not args.limit:
+                legacy_mode = "all"
+        elif args.mode == "likes" and not args.oldest:
+            legacy_mode = "likers"
+        if legacy_mode and not root.exists():
             legacy = argparse.Namespace(**vars(args))
-            legacy.mode = "likers"
+            legacy.mode = legacy_mode
             previous = (Path.cwd() / "exports" / build_job_slug(legacy)).resolve()
             if previous.exists():
                 root = previous
     root.mkdir(parents=True, exist_ok=True)
-    if args.mode in ("all", "oldest", "full"):
+    if args.mode in ("posts", "full"):
         (root / "media").mkdir(exist_ok=True)
     return root
 
@@ -492,11 +448,12 @@ def save_export_state(
     write_json(
         export_state_path(output_dir),
         {
-            "version": 3,
+            "version": 4,
             "job": {
                 "username": args.username,
                 "mode": args.mode,
                 "limit": getattr(args, "limit", None),
+                "oldest": getattr(args, "oldest", False),
                 "after": args.after.isoformat() if args.after else None,
                 "before": args.before.isoformat() if args.before else None,
             },
@@ -514,10 +471,18 @@ def load_export_state(output_dir: Path, args: argparse.Namespace) -> dict[str, A
     if not payload:
         return {}
     job = payload.get("job", {})
+    mode = job.get("mode")
+    oldest = job.get("oldest", mode == "oldest")
+    limit = job.get("limit")
+    if mode in ("all", "oldest"):
+        if mode == "all":
+            limit = 0
+        mode = "posts"
     if (
         job.get("username") != args.username
-        or job.get("mode") != args.mode
-        or job.get("limit") != getattr(args, "limit", None)
+        or mode != args.mode
+        or limit != getattr(args, "limit", None)
+        or oldest != getattr(args, "oldest", False)
         or job.get("after") != (args.after.isoformat() if args.after else None)
         or job.get("before") != (args.before.isoformat() if args.before else None)
     ):
@@ -1047,7 +1012,7 @@ def collect_post_links(
         logger.info("No pagination cursor, returning %s cached links", len(links))
         if total_available and len(links) < total_available:
             logger.warning("Collected %s of %s links before cursor ran out", len(links), total_available)
-            if args.mode == "oldest":
+            if getattr(args, "oldest", False):
                 raise ExportError("Instagram returned an incomplete timeline without a next page. The earliest posts cannot be identified; retry later.")
         save_post_links(output_dir, args, links, total_available, completed=not (total_available and len(links) < total_available), cursor=None)
         return links
@@ -1087,7 +1052,7 @@ def collect_post_links(
         logger.warning("Collected %s of %s links before pagination stopped", len(links), total_available)
     exhausted = cursor is None and not (total_available and len(links) < total_available)
     save_post_links(output_dir, args, links, total_available, completed=exhausted, cursor=cursor)
-    if args.mode == "oldest" and (cursor is not None or (total_available and len(links) < total_available)):
+    if getattr(args, "oldest", False) and (cursor is not None or (total_available and len(links) < total_available)):
         raise ExportError("Could not reach the beginning of the profile. Links are saved; repeat the same command later to continue.")
     return links
 
@@ -1300,12 +1265,12 @@ def build_post_record(session: requests.Session, payload: dict[str, Any], media_
 
 
 def build_mode_label(args: argparse.Namespace) -> str:
-    if args.mode in ("all", "full"):
-        label = "All selected posts, newest first"
-        if args.mode == "full" and args.limit:
-            label = f"Most recent {args.limit} selected posts, newest first"
+    oldest = getattr(args, "oldest", False)
+    limit = getattr(args, "limit", 0)
+    if limit:
+        label = f"First {limit} selected posts, oldest first" if oldest else f"Most recent {limit} selected posts, newest first"
     else:
-        label = f"First {args.limit} selected posts, oldest first"
+        label = "All selected posts, oldest first" if oldest else "All selected posts, newest first"
     dates = date_label(args.after, args.before)
     return f"{label} • {dates}" if dates else label
 
@@ -1450,14 +1415,11 @@ def filter_links_by_date(links: list[str], args: argparse.Namespace, session: re
 
 
 def select_post_links(all_links: list[str], args: argparse.Namespace) -> list[str]:
-    if args.mode == "all":
-        return all_links
     limit = getattr(args, "limit", 0)
-    if limit <= 0:
-        return all_links
-    if args.mode in ("comments", "likes", "full"):
-        return all_links[:limit]
-    return list(reversed(all_links[-limit:]))
+    if getattr(args, "oldest", False):
+        selected = all_links[-limit:] if limit else all_links
+        return list(reversed(selected))
+    return all_links[:limit] if limit else all_links
 
 
 def open_export(path: Path, args: argparse.Namespace) -> None:
@@ -2008,6 +1970,8 @@ def run_comments(args: argparse.Namespace) -> int:
         cached = load_post_links(output_dir, args.username)
         if not cached["links"]:
             raise ExportError("No saved timeline in this folder. Use --output-dir to select the original collection folder.")
+        if args.oldest and not cached["completed"]:
+            raise ExportError("The cached timeline is incomplete; first run without --offline to identify the earliest posts.")
         cache_kind = "likers" if kind == "likes" else kind
         if not any((output_dir / name).exists() for name in (f".{cache_kind}.json", f".{cache_kind}.sqlite")):
             raise ExportError("No saved interaction data in this folder; first collect without --offline.")
