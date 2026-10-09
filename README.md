@@ -13,14 +13,40 @@ Python 3.11+ is required. Install Google Chrome for post exports.
 pip install -r requirements.txt
 ```
 
+To create an isolated environment and install the `igdump` command:
+
+```powershell
+# Windows (PowerShell)
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -e .
+igdump -h
+```
+
+```bash
+# Linux / macOS, from the project folder; Python 3.11+
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+igdump -h
+```
+
+Online `posts` and `full` use an installed Google Chrome. The first login needs
+a graphical session. `--offline` does not launch a browser. Actual runs on
+Linux/macOS have not yet been verified.
+
 ## Commands
 
 Commands choose what to collect: `posts`, `comments`, `likes`, or `full`.
-Options choose which posts to use. Usernames work with or without `@`.
+Options choose which posts to use. Profiles can be specified as `@username`,
+`username`, or `https://www.instagram.com/username/` (including tracking parameters).
 Install the `igdump` command with `pip install -e .`; alternatively, use
 `python insta_html_export.py` as shown below.
 
 ```console
+# A profile URL instead of a username works with every command
+python insta_html_export.py full "https://www.instagram.com/kharlamova_alena/"
+
 # First 100 posts from the beginning of the profile, oldest first
 python insta_html_export.py posts "@kharlamova_alena" --oldest --limit 100
 
@@ -89,7 +115,7 @@ limit, `--oldest` selection and any date filters:
 | `posts` | `index.html`, local media |
 | `comments` | `comments.html`, `comments.csv`, `comments-stats.csv` |
 | `likes` | `likes.html`, `likes.csv`, `likes-stats.csv`, `likes-coverage.csv` |
-| `full` | All the above, with `full.html` linking to the reports |
+| `full` | All the above, four passive reports below, with `full.html` linking to the reports |
 
 HTML opens automatically when collection finishes, including partial results.
 Console progress shows the current stage and counts. Completed posts are saved
@@ -114,6 +140,23 @@ wait before retrying. A missing avatar does not prevent an export.
 post links, then requests pages of users who liked posts. Completed lists are cached. Network
 errors get at most two extra attempts; saved pages resume from their cursor.
 A `429` stops collection instead of retrying every remaining post.
+A 429 from the profile API first falls back to public profile HTML, using
+the original separate session and desktop headers. If that fallback fails, or
+timeline collection is rate-limited, `full` stops the remaining network phases,
+preserves cached progress, and saves a diagnostic summary. If the post timeline fails, comments and likes are skipped rather than
+fetching the same timeline again. HTTP 400 is not retried unchanged; GraphQL can
+fall back to REST when the numeric profile ID is available. Wait before rerunning
+after a 429; restarting immediately does not remove Instagram's rate limit.
+During a post scan, an `SSL EOF` on profile lookup triggers one retry through
+the existing Playwright context's HTTP client with the same login. Certificate
+verification stays enabled; a profile API 429 on either transport uses the
+same HTML fallback.
+If public HTML redirects to login or lacks the profile ID, post scans read the
+profile through the existing logged-in Chrome. Connection resets, SSL EOF and
+timeouts during profile lookup also use this Chrome fallback. Timeline responses
+already received by Chrome are reused; pagination uses the observed GraphQL request
+and Chrome session instead of guessing a replacement document ID. Missing
+location pictures do not invalidate an otherwise usable timeline.
 
 A counter of 43 with 42 returned users is a partial list, not a lost CSV row.
 The API may return fewer accessible accounts than its counter; rechecking
@@ -131,7 +174,7 @@ python insta_html_export.py likes "@kharlamova_alena" --offline
 
 Use the same limit, dates and output folder as the original run. `--offline`
 rebuilds HTML/CSV from the cache with **zero HTTP requests** and no login.
-`comments` also supports it. `--refresh` recollects selected lists.
+Every command supports it. `--refresh` recollects selected lists.
 
 Users who liked posts are saved per page in SQLite; old JSON caches migrate automatically
 and remain as backups. SQL counts the likes; CSV rows are streamed. Memory
@@ -146,6 +189,63 @@ Date filters may need a metadata request per uncached date.
 In an interactive terminal, logs appear above a fixed bottom progress panel;
 redirected output uses plain, occasional progress lines.
 
+## Passive reports
+
+`full` enables four additional reports by default. For other commands use
+`--analytics`, `--mentions`, `--contacts`, and `--locations` independently.
+Disable them in `full` with `--no-analytics`, `--no-mentions`, `--no-contacts`,
+or `--no-locations`.
+
+| Report | Contents |
+|---|---|
+| `analytics.html` | Posting frequency over the observed span, monthly/weekday/hour charts, and a weekday × hour heatmap |
+| `mentions.html` | Caption mentions and media tags, with evidence type and source post |
+| `contacts.html` | Phones, emails and links in captions, normalized values, original captions and source posts |
+| `locations.html` | Received place names, IDs and coordinates, an offline coordinate map and source posts |
+
+Each report has CSV and JSON exports. The saved analytics files use the export
+computer's local time zone. The HTML shows an explicit time zone selector,
+initially set to the browser's local IANA zone (for example `Europe/Moscow`).
+Changing it recalculates dates, months, weekdays, hours, heatmaps and frequency
+locally, including daylight saving at each publication date. Buttons download
+CSV and JSON for the selected zone; existing export files are not overwritten.
+Analytics describes publication times, not audience activity. Frequency includes
+zero-post days between the first and last dated publications in the selection.
+The same date filters and post limit apply to every report.
+In the contacts table, type, normalized value, matched text and source columns
+have fixed widths. Original captions use the remaining space and wrap; long
+captions scroll inside their cell without shrinking the other columns.
+
+Measured collection time and incomplete like-list findings are documented in
+[collection diagnostics](docs/collection-findings.md).
+
+All fields come from normal scan responses or existing caches. These flags add
+**no Instagram requests**: they do not look up mentioned profiles, visit links,
+or request geocoding. Locations include an offline geographic map with zoom/pan
+and source markers (Natural Earth outlines, about 124 KB). Pins show publication
+dates in the export computer's local time zone; click for exact times with UTC
+offsets and source posts. Identical coordinates share a pin with a date range.
+The **Show pin dates** checkbox toggles labels on both maps. **Load street map
+(Internet)** optionally enables OpenStreetMap tiles; no external map requests
+occur before clicking it. Leaflet is bundled locally (about 162 KB). Reports
+show coverage instead of inventing missing timestamps,
+tags or locations. Older caches may lack these fields; recovered local date
+labels are identified separately. Text matches do not verify contact ownership
+or real-world identity.
+
+```console
+igdump posts "@username" --analytics --mentions --contacts --locations
+
+# Rebuild only from an existing folder; no network or media downloads
+igdump posts "@username" --offline --analytics --mentions --contacts --locations --output-dir "exports/username-posts-0"
+
+# All reports from an existing full export
+igdump full "@username" --offline --output-dir "exports/username-full-0"
+```
+
+All CSV exports protect against spreadsheet formulas by prefixing potentially
+executable text with an apostrophe. Original cache and JSON values are unchanged.
+
 ## Options
 
 | Option | Purpose |
@@ -155,7 +255,8 @@ redirected output uses plain, occasional progress lines.
 | `--after DD.MM.YYYY` / `--before DD.MM.YYYY` | Inclusive publication-date bounds |
 | `--download-videos` | Save videos for `posts` / `full`; default: covers only |
 | `--refresh` | Recheck the timeline and update selected posts / interactions |
-| `--offline` | Rebuild interaction reports without network requests (`comments` / `likes`) |
+| `--offline` | Rebuild reports without network requests or login; supported by every command |
+| `--analytics` / `--mentions` / `--contacts` / `--locations` | Passive reports; enabled by default in `full`, disabled with `--no-…` |
 | `--no-open` | Do not open the finished HTML automatically |
 | `--output-dir "C:\Archives\instagram"` | Custom output folder |
 | `--dry-run` | Select and count posts without downloading media / interactions; needs Instagram access |
@@ -165,7 +266,7 @@ redirected output uses plain, occasional progress lines.
 | `--sessionid COOKIE` | Session cookie for `comments` / `likes`; saved sessions are reused |
 | `--comment-delay 3` / `--like-delay 3` | Request delay in seconds for the corresponding command (default: 2) |
 | `--verbose` / `--quiet` | Detailed / minimal console output |
-| `--help` | Command help, e.g. `python insta_html_export.py likes --help` |
+| `-h` / `--help` | General help: `igdump -h`; command options: `igdump full -h` |
 
 Put options after the command. Downloaded videos play in the HTML archive,
 including mixed image/video carousels.

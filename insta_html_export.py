@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import logging
 import mimetypes
@@ -18,7 +17,7 @@ from importlib.metadata import version as _pkg_version, PackageNotFoundError
 from pathlib import Path
 from typing import Any
 from collections import deque
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs, urlencode
 from string import Template
 
 # ── Debug log (structured, AI-readable) ──────────────────────────────────────
@@ -77,6 +76,12 @@ def _patch_session_for_logging(session: requests.Session) -> None:
                          elapsed_ms=elapsed,
                          method=request.method,
                          url=re.sub(r"(sessionid|csrftoken)=[^&]+", r"\1=***", str(request.url)))
+            request_url = urlparse(str(request.url))
+            # Profile API limits are endpoint-specific: its caller can use
+            # the existing public HTML fallback before giving up.
+            if (request_url.hostname in ("www.instagram.com", "instagram.com")
+                    and request_url.path.rstrip("/") != "/api/v1/users/web_profile_info"):
+                raise_if_rate_limited(response, request_url.path)
             return response
         except requests.RequestException as exc:
             elapsed = int((time.monotonic() - t0) * 1000)
@@ -93,6 +98,8 @@ import requests
 from igdump_storage import read_json, write_json, load_comment_cache, save_comment_cache, LikerStore
 from igdump_dates import parse_date, post_date, date_matches, date_label
 from igdump_progress import update_progress, TerminalUI, record_request, prompt_input
+from igdump_csv import write_csv
+from igdump_insights import REPORTS, publication_details, remember_details, save_details, cached_details, generate_reports
 from playwright.sync_api import BrowserContext, Error as PlaywrightError, Page, Playwright, TimeoutError, sync_playwright
 
 logger = logging.getLogger("igdump")
@@ -130,6 +137,36 @@ except PackageNotFoundError:
 
 class ExportError(RuntimeError):
     pass
+
+
+class InstagramRateLimitError(ExportError):
+    """A run-wide stop condition, never a reason to try another endpoint."""
+
+
+class ProfileHTMLUnavailableError(ExportError):
+    """Public HTML cannot identify the profile; authenticated Chrome can."""
+
+
+def raise_if_rate_limited(response, context):
+    if response.status_code == 429:
+        response.close()
+        raise InstagramRateLimitError(f"Instagram rate limited (429) during {context}. Collection stopped; wait before retrying. Cached progress is preserved.")
+
+
+def is_rate_limited(error):
+    response = getattr(error, "response", None)
+    return (isinstance(error, InstagramRateLimitError)
+            or (response is not None and response.status_code == 429)
+            or bool(re.search(r"\b429\b|rate[- ]limit", str(error), re.I)))
+
+
+def retryable_request_error(error):
+    if is_rate_limited(error):
+        return False
+    if isinstance(error, requests.HTTPError):
+        response = error.response
+        return response is not None and 500 <= response.status_code < 600
+    return isinstance(error, (requests.ConnectionError, requests.Timeout))
 
 
 class InstagramBrowser:
@@ -249,9 +286,24 @@ def public_api_session() -> requests.Session:
 
 
 def instagram_username(value: str) -> str:
+    error = "Enter @username, username, or an Instagram profile URL such as https://www.instagram.com/username/."
     username = value.removeprefix("@")
+    if "://" in value or value.lower().startswith(("instagram.com/", "www.instagram.com/", "m.instagram.com/")):
+        try:
+            profile = urlparse(value if "://" in value else "https://" + value)
+            match = re.fullmatch(r"/([A-Za-z0-9._]{1,30})/?", profile.path)
+            if (profile.scheme.lower() not in ("http", "https")
+                or profile.hostname not in ("instagram.com", "www.instagram.com", "m.instagram.com")
+                or profile.username is not None or profile.password is not None or profile.port is not None
+                or match is None):
+                raise ValueError
+            username = match[1]
+            if username.lower() in {"p", "reel", "reels", "tv", "stories", "explore", "accounts", "direct", "about", "legal"}:
+                raise ValueError
+        except ValueError:
+            raise argparse.ArgumentTypeError(error) from None
     if not re.fullmatch(r"[A-Za-z0-9._]{1,30}", username):
-        raise argparse.ArgumentTypeError("Enter a username such as @kharlamova_alena, without a URL or spaces.")
+        raise argparse.ArgumentTypeError(error)
     return username
 
 
@@ -299,13 +351,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
   igdump likes @kharlamova_alena --oldest --limit 100
       Users who liked the first 100 posts, with participation statistics.
   igdump full @kharlamova_alena --after 01.01.2024 --before 31.12.2024
-      Posts and both statistics for the specified date range.
+      Posts, comments, likes and all passive reports for the date range.
+  igdump posts "https://instagram.com/kharlamova_alena/" --analytics --mentions --contacts --locations
+      Posts with publication charts, mentioned/tagged accounts, contacts and locations.
+  igdump full "@kharlamova_alena" --offline --output-dir "exports/kharlamova_alena-full-0"
+      Rebuild all reports from the original export folder without network requests.
 
 Commands choose what to collect. Options choose which posts to use.
 No --limit (or --limit 0) means all posts. --oldest selects earliest posts.
 Dates include both boundary days and apply before --limit.
+full enables --analytics, --mentions, --contacts and --locations by default.
+Other commands enable these reports with flags; --no-analytics, --no-mentions,
+--no-contacts and --no-locations disable individual reports in full.
+Passive reports use received or cached data and add no Instagram requests.
 --oldest requires the complete timeline; incomplete timelines stop selection.
-Quote @usernames in PowerShell. The @ prefix is optional.
+Quote @usernames in PowerShell. The @ prefix is optional; profile URLs also work.
+Example: igdump full "https://www.instagram.com/kharlamova_alena/"
 Without the installed command, use: python insta_html_export.py posts USERNAME
 Command help: igdump posts --help
 Legacy post commands: all = posts; oldest = posts --oldest --limit N.
@@ -317,7 +378,7 @@ Legacy post commands: all = posts; oldest = posts --oldest --limit N.
                         offline=False, retry_missing=False)
     subparsers = parser.add_subparsers(dest="mode", required=True)
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("username", type=instagram_username, metavar="USERNAME", help="Instagram username, with or without @.")
+    common.add_argument("username", type=instagram_username, metavar="USERNAME", help="Instagram username, with or without @, or a profile URL (https://www.instagram.com/username/).")
     common.add_argument("--limit", type=nonnegative_int, default=0, metavar="N",
                         help="Maximum number of posts after date filters (0 or omitted = all). Latest posts by default; earliest with --oldest. This limits posts, not comments or users.")
     common.add_argument("--oldest", action="store_true", help="Select earliest posts and show them oldest first. Without a limit, show all selected posts oldest first.")
@@ -328,6 +389,10 @@ Legacy post commands: all = posts; oldest = posts --oldest --limit N.
     common.add_argument("--dry-run", action="store_true", help="Cache the timeline and report the selected post count without collecting media, comments or likes. Requires Instagram access.")
     common.add_argument("--no-open", action="store_true", help="Do not open the finished HTML automatically.")
     common.add_argument("--browser-profile-dir", default=str(DEFAULT_PROFILE_DIR), help="Saved Chrome profile used for Instagram login (default: ~/.insta-export/chrome-profile).")
+    common.add_argument("--offline", action="store_true", help="Rebuild reports from the original collection folder without login or HTTP requests. Keep the same selection or specify --output-dir.")
+    for flag, title in REPORTS.items():
+        common.add_argument(f"--{flag}", action=argparse.BooleanOptionalAction, default=None,
+                            help=f"{title} from received/cached posts only, with no extra requests (default: enabled in full).")
     verbosity = common.add_mutually_exclusive_group()
     verbosity.add_argument("--verbose", action="store_true", help="Show detailed debug logs.")
     verbosity.add_argument("--quiet", action="store_true", help="Show only warnings and errors.")
@@ -343,8 +408,8 @@ Legacy post commands: all = posts; oldest = posts --oldest --limit N.
         help="Collect users who liked posts and participation statistics.",
         description="Users who liked selected posts: likes.html, likes.csv and likes-stats.csv. No post media downloads. Incomplete lists are automatically rechecked once.")
     full = subparsers.add_parser("full", parents=[common],
-        help="Export posts and both participation statistics.",
-        description="Posts, comments and users who liked the same selected posts. All phases use the Chrome session. full.html links to the three reports and opens after collection.")
+        help="Export posts, comments, likes and passive publication reports.",
+        description="Posts, comments, likes and passive publication reports for the same selected posts. Online phases share the Chrome session. full.html links to all enabled reports and opens after collection.")
     for command in (posts, full):
         command.add_argument("--download-videos", action="store_true", help="Download videos; by default, save only photos and video covers.")
         command.add_argument("--batch-size", type=positive_int, default=9, metavar="N", help="Cards loaded per scroll batch in the post archive (default: 9). Does not change request batching.")
@@ -356,8 +421,6 @@ Legacy post commands: all = posts; oldest = posts --oldest --limit N.
     for command in (likes, full):
         command.add_argument("--like-delay", type=nonnegative_delay, default=2.0, metavar="SECONDS", help="Delay between like-list requests, including automatic rechecks (default: 2 seconds).")
         command.add_argument("--retry-missing", action="store_true", help=argparse.SUPPRESS)
-    for command in (comments, likes):
-        command.add_argument("--offline", action="store_true", help="Rebuild HTML and CSV from the original collection folder without login or HTTP requests. Keep the same selection or specify --output-dir.")
 
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments[:2] == ["all", "oldest"]:
@@ -370,12 +433,17 @@ Legacy post commands: all = posts; oldest = posts --oldest --limit N.
     elif legacy == "likers":
         arguments[0] = "likes"
     parsed = parser.parse_args(arguments)
+    for flag in REPORTS:
+        if getattr(parsed, flag) is None:
+            setattr(parsed, flag, parsed.mode == "full")
     if legacy == "oldest" and parsed.limit <= 0:
         parser.error("The legacy oldest command requires --limit N greater than 0. Use posts --oldest for an unlimited selection.")
     if parsed.after and parsed.before and parsed.after > parsed.before:
         parser.error("--after must not be later than --before.")
     if parsed.offline and (parsed.refresh or parsed.dry_run or parsed.retry_missing):
         parser.error("--offline cannot be combined with --refresh, --dry-run or --retry-missing.")
+    if parsed.offline and (parsed.headful or parsed.download_videos):
+        parser.error("--offline cannot be combined with --headful or --download-videos.")
     return parsed
 
 
@@ -609,26 +677,30 @@ def preflight_instagram_access(browser: InstagramBrowser) -> None:
         assert_page_is_usable(page, IG_BASE_URL)
         body_text = page.text_content("body") or ""
         if "Please wait a few minutes before you try again" in body_text:
-            raise ExportError(
+            raise InstagramRateLimitError(
                 "Instagram is temporarily rate-limiting this browser session before export start. Wait and retry later."
             )
     finally:
         page.close()
 
 
-def _scrape_profile_html(username: str) -> tuple[dict[str, Any], list[str], str | None, str]:
+def _scrape_profile_html(username: str, session=None) -> tuple[dict[str, Any], list[str], str | None, str]:
     """Scrape profile info from Instagram's public HTML page (no API call).
 
     Falls back to parsing the server-rendered <script> data and <meta> tags.
     """
     _debug_event("profile.source", "HTML scrape", username=username)
-    sess = _make_session()
-    sess.headers["User-Agent"] = (
+    sess = session if session is not None else _make_session()
+    if session is None:
+        sess.headers["User-Agent"] = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
     resp = sess.get(f"{IG_BASE_URL}/{username}/", timeout=30)
+    raise_if_rate_limited(resp, "profile HTML")
     resp.raise_for_status()
+    if any(path in urlparse(resp.url).path for path in ("/accounts/login", "/auth_platform/")):
+        raise ProfileHTMLUnavailableError("Public profile HTML redirected to login or verification.")
     text = resp.text
     _debug_event("profile.html_size", f"HTML {len(text)} bytes")
 
@@ -656,10 +728,13 @@ def _scrape_profile_html(username: str) -> tuple[dict[str, Any], list[str], str 
                 user_obj.get("id")
                 or (data.get("user") or {}).get("id")
                 or (data.get("users") or {}).get(username, {}).get("id")
-                or data.get("pk")
+                or user_obj.get("pk")
                 or ""
             )
 
+            if not str(uid).isdigit() or (user_obj.get("username") and user_obj["username"].casefold() != username.casefold()):
+                uid = ""
+            uid = str(uid)
             profile = {
                 "username": user_obj.get("username") or username,
                 "full_name": user_obj.get("full_name") or username,
@@ -671,7 +746,7 @@ def _scrape_profile_html(username: str) -> tuple[dict[str, Any], list[str], str 
             }
             _debug_event("profile.init_state_ok", f"links={len(links)}, uid={uid!r}", links_count=len(links), uid=uid or None)
             if not uid:
-                uid = _resolve_user_id_via_search(username)
+                uid = _extract_user_id_from_html(text, username) or _resolve_user_id_via_search(username, session=sess)
             return profile, links, pi.get("end_cursor"), uid
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             _debug_event("profile.json_error", f"__INITIAL_STATE__ parse failed: {exc}")
@@ -693,7 +768,7 @@ def _scrape_profile_html(username: str) -> tuple[dict[str, Any], list[str], str 
     display_name = raw.split("(")[0].strip() if "(" in raw else raw
     scraped_username = (re.search(r"@(\w+)", raw).group(1) if re.search(r"@(\w+)", raw) else username)
 
-    uid = _extract_user_id_from_html(text)
+    uid = _extract_user_id_from_html(text, username)
 
     profile = {
         "username": scraped_username,
@@ -708,12 +783,12 @@ def _scrape_profile_html(username: str) -> tuple[dict[str, Any], list[str], str 
 
     # 3. If still no user_id, try search API
     if not uid:
-        uid = _resolve_user_id_via_search(username)
+        uid = _resolve_user_id_via_search(username, session=sess)
 
     return profile, links, None, uid
 
 
-def _extract_user_id_from_html(text: str) -> str:
+def _extract_user_id_from_html(text: str, username: str | None = None) -> str:
     """Try multiple methods to find the numeric user id in HTML."""
     # Method 1: ld+json structured data (most reliable)
     for ld_m in re.finditer(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', text, re.DOTALL):
@@ -721,12 +796,61 @@ def _extract_user_id_from_html(text: str) -> str:
             ld = json.loads(ld_m.group(1))
             if isinstance(ld, dict):
                 val = ld.get("identifier") or ""
-                if val:
+                if isinstance(val, dict):
+                    val = val.get("value", "")
+                if str(val).isdigit():
                     return str(val)
         except (json.JSONDecodeError, TypeError):
             continue
 
-    # Method 2: regex patterns on raw HTML
+    # Embedded data can include the logged-in viewer and media IDs. Match the
+    # requested profile before accepting a generic id/pk field.
+    def find_user(value):
+        if isinstance(value, dict):
+            if username and str(value.get("username", "")).casefold() == username.casefold():
+                uid = value.get("id") or value.get("pk") or ""
+                if str(uid).isdigit():
+                    return str(uid)
+            for child in value.values():
+                found = find_user(child)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = find_user(child)
+                if found:
+                    return found
+        elif isinstance(value, str) and value.lstrip().startswith(("{", "[")):
+            try:
+                return find_user(json.loads(value))
+            except (ValueError, RecursionError):
+                pass
+        return ""
+    for script in re.findall(r'<script[^>]*>(.*?)</script>', text, re.DOTALL):
+        try:
+            found = find_user(json.loads(script))
+            if found:
+                return found
+        except (ValueError, RecursionError):
+            pass
+    if username:
+        # Some scripts contain a JavaScript wrapper instead of a JSON document;
+        # extract only an object explicitly identifying the requested account.
+        for variant in (text, text.replace('\\"', '"')):
+            for candidate in re.findall(r'\{[^{}]*"username"\s*:\s*"' + re.escape(username) + r'"[^{}]*\}', variant, re.I):
+                try:
+                    found = find_user(json.loads(candidate))
+                    if found:
+                        return found
+                except ValueError:
+                    pass
+            ids = set(re.findall(r'(?:"profile_id"\s*:\s*"?(\d+)|profilePage_(\d+))', variant))
+            ids = {a or b for a, b in ids}
+            if len(ids) == 1 and username.casefold() in variant.casefold():
+                return ids.pop()
+        return ""
+
+    # Legacy callers without a target profile.
     patterns = [
         r'"pk":\s*(\d{5,})',
         r'"id":\s*"(\d{5,})"',
@@ -742,13 +866,14 @@ def _extract_user_id_from_html(text: str) -> str:
     return ""
 
 
-def _resolve_user_id_via_search(username: str) -> str:
+def _resolve_user_id_via_search(username: str, session=None) -> str:
     """Resolve numeric user_id via Instagram's search/topsearch API.
 
     This endpoint has different rate-limit characteristics from web_profile_info.
     """
-    sess = _make_session()
-    sess.headers["User-Agent"] = (
+    sess = session if session is not None else _make_session()
+    if session is None:
+        sess.headers["User-Agent"] = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
@@ -759,10 +884,7 @@ def _resolve_user_id_via_search(username: str) -> str:
                 params={"query": username},
                 timeout=15,
             )
-            if resp.status_code == 429:
-                _debug_event("search.429", f"search API rate limited, retrying in 10s")
-                _safe_sleep(10, jitter=0.2)
-                continue
+            raise_if_rate_limited(resp, "profile ID search")
             resp.raise_for_status()
             data = resp.json()
             users = data.get("users") or []
@@ -776,7 +898,7 @@ def _resolve_user_id_via_search(username: str) -> str:
             return ""
         except requests.RequestException as exc:
             _debug_event("search.error", f"search API failed: {exc}")
-            if attempt == 0:
+            if attempt == 0 and retryable_request_error(exc):
                 _safe_sleep(3)
                 continue
             return ""
@@ -784,14 +906,40 @@ def _resolve_user_id_via_search(username: str) -> str:
 
 
 def fetch_profile_info(session: requests.Session, username: str) -> tuple[dict[str, Any], list[str], str | None, str]:
-    response = session.get(
-        f"{IG_BASE_URL}/api/v1/users/web_profile_info/?username={username}",
-        timeout=30,
-    )
+    url = f"{IG_BASE_URL}/api/v1/users/web_profile_info/?username={username}"
+    try:
+        response = session.get(url, timeout=(10, 20))
+    except requests.exceptions.SSLError as exc:
+        transport = getattr(session, "_igdump_profile_transport", None)
+        if transport is None or not re.search(r"UNEXPECTED_EOF|SSLEOFError", str(exc), re.I):
+            raise
+        logger.warning("Profile TLS connection closed unexpectedly. Trying Playwright transport once ...")
+        _debug_event("http.send", "Profile lookup via Playwright", method="GET", url=url)
+        try:
+            native = transport.get(url, headers=dict(session.headers), timeout=20000,
+                                   fail_on_status_code=False, max_redirects=0)
+            try:
+                response = requests.Response()
+                response.status_code = native.status
+                response.url = native.url
+                response.headers.update(native.headers)
+                response._content = native.body()
+                response._content_consumed = True
+                _debug_event("http.done", "Profile lookup via Playwright", status=native.status, url=url)
+            finally:
+                native.dispose()
+        except PlaywrightError as fallback:
+            raise ExportError("Profile connection failed through both Requests (SSL EOF) and Playwright. "
+                              "Check the connection to Instagram and retry later.") from fallback
     if response.status_code == 429:
+        response.close()
         logger.warning("API rate limited (429). Trying HTML scrape ...")
         _debug_event("profile.fallback", "API 429 → HTML scrape", username=username)
+        # Preserve the original fallback's public session and desktop headers.
         return _scrape_profile_html(username)
+    if response.status_code == 400:
+        logger.warning("Profile API returned 400. Trying authenticated profile HTML once ...")
+        return _scrape_profile_html(username, session=session)
     response.raise_for_status()
     payload = response.json()
     user = payload.get("data", {}).get("user")
@@ -819,8 +967,69 @@ def fetch_profile_info(session: requests.Session, username: str) -> tuple[dict[s
         "avatar_url": user.get("profile_pic_url_hd") or user.get("profile_pic_url"),
     }
     end_cursor = media.get("page_info", {}).get("end_cursor")
-    user_id = str(user.get("id"))
+    user_id = str(user.get("id") or user.get("pk") or "")
     return profile, initial_links, end_cursor, user_id
+
+
+def resolve_profile_for_posts(session, browser, username):
+    try:
+        profile, links, cursor, uid = fetch_profile_info(session, username)
+    except (ProfileHTMLUnavailableError, requests.ConnectionError, requests.Timeout) as exc:
+        if is_rate_limited(exc):
+            raise
+        if isinstance(exc, requests.exceptions.SSLError) and not re.search(r"UNEXPECTED_EOF|SSLEOFError", str(exc), re.I):
+            raise
+        logger.warning("%s Trying the logged-in Chrome profile page ...", exc)
+        profile, links, cursor, uid = {"username": username}, [], None, ""
+    if uid:
+        return profile, links, cursor, uid
+    logger.warning("Profile ID unavailable in public HTML. Reading the logged-in Chrome profile page ...")
+    context = browser.require_context()
+    def capture(response):
+        if "/graphql/query" not in response.url or response.status != 200:
+            return
+        try:
+            form = {key: values[-1] for key, values in parse_qs(response.request.post_data or "", keep_blank_values=True).items()}
+            variables = json.loads(form.get("variables", "{}"))
+            if variables.get("username", "").casefold() != username.casefold():
+                return
+            payload = response.json()
+            media = (payload.get("data") or {}).get("xdt_api__v1__feed__user_timeline_graphql_connection")
+            if not isinstance(media, dict) or not form.get("doc_id"):
+                return
+            pages = getattr(session, "_igdump_timeline_pages", {})
+            pages[variables.get("after")] = payload
+            session._igdump_timeline_pages = pages
+            templates = getattr(session, "_igdump_timeline_templates", {})
+            templates["next" if variables.get("after") else "first"] = {
+                "form": form, "variables": variables,
+                "headers": {key: value for key, value in response.request.all_headers().items()
+                            if key.lower() not in ("cookie", "host", "content-length", "accept-encoding")},
+            }
+            session._igdump_timeline_templates = templates
+        except (ValueError, TypeError, PlaywrightError):
+            return
+    context.on("response", capture)
+    page = browser.open_page(f"{IG_BASE_URL}/{username}/")
+    try:
+        page.wait_for_timeout(2500)
+        assert_page_is_usable(page, f"{IG_BASE_URL}/{username}/")
+        if "Please wait a few minutes before you try again" in (page.text_content("body") or ""):
+            raise InstagramRateLimitError("Instagram limited the authenticated profile page. Cached data is preserved.")
+        uid = _extract_user_id_from_html(page.content(), username)
+        if not uid:
+            uid = _resolve_user_id_via_search(username, session=session)
+        if not uid:
+            raise ExportError(f"Could not identify @{username}: public HTML and the logged-in Chrome page supplied no profile ID.")
+        _debug_event("profile.browser_ok", "Profile ID from authenticated page", username=username, uid=uid)
+        templates = getattr(session, "_igdump_timeline_templates", None)
+        if isinstance(templates, dict) and templates:
+            session._igdump_timeline_page = page
+        return profile, links, cursor, uid
+    finally:
+        context.remove_listener("response", capture)
+        if getattr(session, "_igdump_timeline_page", None) is not page:
+            page.close()
 
 
 def unique_keep_order(values: list[str]) -> list[str]:
@@ -865,15 +1074,7 @@ def fetch_user_timeline_rest(
         raise ExportError(
             "Instagram redirected to login on REST timeline — your sessionid is expired or invalid."
         )
-    if resp.status_code == 429:
-        logger.warning("REST timeline rate limited (429). Waiting 30s ...")
-        _safe_sleep(30, jitter=0.2)
-        resp = session.get(
-            f"{IG_BASE_URL}/api/v1/feed/user/{user_id}/",
-            params=params,
-            timeout=30,
-            allow_redirects=False,
-        )
+    raise_if_rate_limited(resp, "REST timeline")
     resp.raise_for_status()
     data = resp.json()
 
@@ -908,16 +1109,54 @@ def _try_graphql_timeline(
     if after_cursor:
         variables["after"] = after_cursor
 
-    response = session.post(
-        f"{IG_BASE_URL}/graphql/query/",
-        data={
-            "variables": json.dumps(variables, separators=(",", ":")),
-            "doc_id": AUTH_PROFILE_DOC_ID,
-            "server_timestamps": "true",
-        },
-        timeout=30,
-        allow_redirects=False,
-    )
+    cached_pages = getattr(session, "_igdump_timeline_pages", {})
+    if not isinstance(cached_pages, dict):
+        cached_pages = {}
+    if after_cursor in cached_pages:
+        payload = cached_pages.pop(after_cursor)
+        return _parse_timeline_payload(session, username, payload)
+    templates = getattr(session, "_igdump_timeline_templates", {})
+    if not isinstance(templates, dict):
+        templates = {}
+    template = templates.get("next" if after_cursor else "first")
+    form = {
+        "variables": json.dumps(variables, separators=(",", ":")),
+        "doc_id": AUTH_PROFILE_DOC_ID,
+        "server_timestamps": "true",
+    }
+    headers = None
+    if template:
+        variables = {**template["variables"]}
+        if after_cursor:
+            variables["after"] = after_cursor
+        else:
+            variables.pop("after", None)
+        form = {**template["form"], "variables": json.dumps(variables, separators=(",", ":"))}
+        headers = template["headers"]
+    browser_page = getattr(session, "_igdump_timeline_page", None)
+    if template and browser_page is not None:
+        url = f"{IG_BASE_URL}/graphql/query/"
+        _debug_event("http.send", "Timeline through Chrome", method="POST", url=url)
+        browser_response = browser_page.evaluate("""async ({url, body, headers}) => {
+            const response = await fetch(url, {method: 'POST', body, headers,
+                credentials: 'include', redirect: 'manual', signal: AbortSignal.timeout(20000)});
+            return {status: response.status, body: await response.text()};
+        }""", {"url": url, "body": urlencode(form), "headers": {
+            **{key: value for key, value in headers.items() if key.lower().startswith("x-")},
+            "content-type": "application/x-www-form-urlencoded",
+        }})
+        response = requests.Response()
+        response.status_code = browser_response["status"]
+        response.url = url
+        response._content = browser_response["body"].encode("utf-8")
+        response._content_consumed = True
+        _debug_event("http.done", "Timeline through Chrome", status=response.status_code, url=url)
+    else:
+        response = session.post(
+            f"{IG_BASE_URL}/graphql/query/", data=form, headers=headers,
+            timeout=30, allow_redirects=False,
+        )
+    raise_if_rate_limited(response, "GraphQL timeline")
     if response.status_code in (302, 303, 307):
         raise ExportError("GraphQL endpoint redirected to login — session expired.")
     if response.status_code == 403:
@@ -925,9 +1164,21 @@ def _try_graphql_timeline(
 
     response.raise_for_status()
     payload = response.json()
-    _doc_id_guard(payload, f"pagination for @{username}")
+    return _parse_timeline_payload(session, username, payload)
 
+
+def _parse_timeline_payload(session, username, payload):
     media = payload.get("data", {}).get("xdt_api__v1__feed__user_timeline_graphql_connection")
+    errors = payload.get("errors")
+    optional_location_errors = (isinstance(errors, list) and errors and isinstance(media, dict)
+        and isinstance(media.get("edges"), list) and isinstance(media.get("page_info"), dict)
+        and all(isinstance(error, dict) and isinstance(error.get("path"), list)
+                and "location" in error["path"]
+                and error["path"][-1] in ("profile_pic_url", "profile_pic_url_hd") for error in errors))
+    if optional_location_errors:
+        logger.warning("Instagram omitted location pictures on %s posts; timeline data is usable.", len(errors))
+    else:
+        _doc_id_guard(payload, f"pagination for @{username}")
     if not media:
         raise ExportError(
             f"Instagram did not return paginated profile media for @{username}. "
@@ -961,12 +1212,15 @@ def fetch_authenticated_timeline_page(
             _debug_event("timeline.method", "Trying GraphQL", username=username)
             return _try_graphql_timeline(session, username, after_cursor)
         except (ExportError, requests.RequestException) as exc:
-            if retry == 0:
+            if is_rate_limited(exc):
+                raise
+            if retry == 0 and retryable_request_error(exc):
                 logger.warning("GraphQL failed (%s). Retrying once after 3s ...", exc)
                 _safe_sleep(3, jitter=0.3)
                 continue
             logger.warning("GraphQL failed (%s). Trying REST fallback ...", exc)
             _debug_event("timeline.fallback", f"GraphQL → REST: {exc}", username=username, user_id=user_id)
+            break
 
     # Fall back to REST if we have user_id
     if user_id:
@@ -975,7 +1229,9 @@ def fetch_authenticated_timeline_page(
                 _debug_event("timeline.method", "Trying REST", user_id=user_id)
                 return fetch_user_timeline_rest(session, user_id, after_cursor)
             except requests.RequestException as exc:
-                if retry == 0:
+                if is_rate_limited(exc):
+                    raise
+                if retry == 0 and retryable_request_error(exc):
                     logger.warning("REST timeline failed (%s). Retrying once after 3s ...", exc)
                     _safe_sleep(3, jitter=0.3)
                     continue
@@ -1151,7 +1407,7 @@ def _scrape_post_payload_once(browser: InstagramBrowser, url: str) -> dict[str, 
             pass
         body_text = page.text_content("body") or ""
         if "Please wait a few minutes before you try again" in body_text:
-            raise ExportError(f"Instagram rate-limited post page access for {url}. Wait and retry later.")
+            raise InstagramRateLimitError(f"Instagram rate-limited post page access for {url}. Wait and retry later.")
 
         if hits:
             return hits[0]
@@ -1225,6 +1481,7 @@ def build_post_record(session: requests.Session, payload: dict[str, Any], media_
                 first_alt = item.get("accessibility_caption") or ""
         alt_text = first_alt or caption[:120] or f"Instagram post {shortcode}"
         return {
+            **publication_details(payload),
             "shortcode": shortcode,
             "caption": caption,
             "local_media_path": media_paths[0],
@@ -1249,6 +1506,7 @@ def build_post_record(session: requests.Session, payload: dict[str, Any], media_
     alt_text = item.get("accessibility_caption") or payload.get("accessibility_caption") or caption[:120] or f"Instagram post {shortcode}"
 
     return {
+        **publication_details(payload),
         "shortcode": shortcode,
         "caption": caption,
         "local_media_path": f"media/{media_file.name}",
@@ -1282,6 +1540,7 @@ def generate_html(
     mode_label: str,
     output_dir: Path,
     batch_size: int,
+    report_names: list[str] | None = None,
 ) -> None:
     post_records = [
         {**record, "date_label": "Date unknown"}
@@ -1314,12 +1573,17 @@ def generate_html(
         bio=escape(profile.get("biography") or "No biography provided."),
         post_data=raw_json,
     )
+    report_links = "".join(f'<a href="{kind}.html">{escape(title)}</a> ' for kind, title in REPORTS.items()
+                           if (report_names is None or kind in report_names) and (output_dir / f"{kind}.html").exists())
+    if report_links:
+        html = html.replace('<main class="page">', '<main class="page"><nav aria-label="Publication reports" style="padding:16px 0;display:flex;gap:20px;flex-wrap:wrap">' + report_links + '</nav>')
     index_file = output_dir / "index.html"
     index_file.write_text(html, encoding="utf-8")
     logger.debug("HTML saved to %s", index_file)
 
 
 def remember_post_dates(session: requests.Session, items: list[dict[str, Any]]) -> None:
+    remember_details(session, items)
     dates = getattr(session, "_igdump_post_dates", None)
     if not isinstance(dates, dict):
         dates = {}
@@ -1340,6 +1604,7 @@ def remember_post_dates(session: requests.Session, items: list[dict[str, Any]]) 
 
 
 def save_post_metadata(session, output_dir, username):
+    save_details(session, output_dir, username)
     path = output_dir / ".post-likes.json"
     payload = read_json(path) or {}
     counts = payload.get("counts", {}) if payload.get("username") == username else {}
@@ -1367,6 +1632,7 @@ def fetch_post_date(session: requests.Session, url: str) -> str | None:
         if data.get("status") == "fail":
             raise ExportError(f"Instagram did not return a publication date for {code}: {data.get('message', 'API error')}")
         items = data.get("items") or []
+        remember_post_dates(session, items)
         value = post_date(items[0]) if items else None
         return value.isoformat() if value else None
     finally:
@@ -1381,6 +1647,11 @@ def filter_links_by_date(links: list[str], args: argparse.Namespace, session: re
     dates = payload.get("dates", {}) if payload.get("username") == args.username and not args.refresh else {}
     if not isinstance(dates, dict):
         dates = {}
+    if not args.refresh:
+        for detail in cached_details(output_dir, args.username, links):
+            value = post_date(detail)
+            if value and detail["shortcode"] not in dates:
+                dates[detail["shortcode"]] = value.isoformat()
     timeline_dates = getattr(session, "_igdump_post_dates", None)
     if isinstance(timeline_dates, dict):
         dates.update(timeline_dates)
@@ -1395,6 +1666,7 @@ def filter_links_by_date(links: list[str], args: argparse.Namespace, session: re
             logger.info("Checking date %s/%s: %s", index, len(links), code)
             _safe_sleep(1)
             dates[code] = fetch_post_date(session, url)
+            save_post_metadata(session, output_dir, args.username)
             write_json(path, {"username": args.username, "dates": dates})
         value = dates[code]
         if value is None:
@@ -1434,6 +1706,8 @@ def open_export(path: Path, args: argparse.Namespace) -> None:
 
 def run(args: argparse.Namespace) -> int:
     output_dir = ensure_output_dir(args.output_dir, args)
+    if args.offline:
+        return run_posts_offline(args, output_dir)
     profile_dir = Path(args.browser_profile_dir).expanduser().resolve()
 
     with InstagramBrowser(profile_dir=profile_dir, headful=args.headful) as browser:
@@ -1442,7 +1716,12 @@ def run(args: argparse.Namespace) -> int:
         session = browser.authenticated_session()
         _patch_session_for_logging(session)
         args._shared_session = session
-        profile, _, _, user_id = fetch_profile_info(session, args.username)
+        update_progress("Profile", 0, detail="resolving profile")
+        session._igdump_profile_transport = browser.require_context().request
+        try:
+            profile, _, _, user_id = resolve_profile_for_posts(session, browser, args.username)
+        finally:
+            del session._igdump_profile_transport
         logger.info("Resolved @%s profile metadata", profile["username"])
 
         # Try to resume from saved cursor; if missing, fetch first page fresh.
@@ -1497,6 +1776,8 @@ def run(args: argparse.Namespace) -> int:
                 try:
                     avatar_file = download_binary(session, avatar_url, output_dir / "avatar")
                 except (ExportError, requests.RequestException, OSError) as exc:
+                    if is_rate_limited(exc):
+                        raise
                     logger.warning("Could not download the avatar: %s. Continuing without it.", exc)
             else:
                 logger.info("Avatar unavailable; continuing the post export.")
@@ -1536,7 +1817,8 @@ def run(args: argparse.Namespace) -> int:
                        if (code := parse_shortcode_from_url(url)) in by_code]
             save_export_state(output_dir, args, profile, avatar_name, ordered, completed=completed)
             generate_html(profile=profile, post_records=ordered, avatar_src=avatar_name,
-                          mode_label=build_mode_label(args), output_dir=output_dir, batch_size=max(1, args.batch_size))
+                          mode_label=build_mode_label(args), output_dir=output_dir, batch_size=max(1, args.batch_size),
+                          report_names=[kind for kind in REPORTS if getattr(args, kind, False)])
 
         checkpoint()
         errors: list[str] = []
@@ -1546,18 +1828,23 @@ def run(args: argparse.Namespace) -> int:
             try:
                 payload = scrape_post_payload(browser, post_url)
                 remember_post_dates(session, [{**payload, "code": shortcode}])
+                save_post_metadata(session, output_dir, args.username)
                 record = build_post_record(session, payload, output_dir / "media", index, post_url,
                                            download_videos=args.download_videos)
             except (ExportError, requests.RequestException, PlaywrightError, OSError) as exc:
                 logger.error("Could not export %s: %s", shortcode, exc)
                 errors.append(shortcode)
                 update_progress("Posts", len(post_records) + len(errors), len(selected_links), "failed")
+                if is_rate_limited(exc):
+                    args._rate_limited = True
+                    break
                 continue
             post_records.append(record)
             checkpoint()
             update_progress("Posts", len(post_records) + len(errors), len(selected_links))
 
         completed = len(post_records) == len(selected_links) and not errors and timeline_complete
+        passive_reports(args, output_dir, session, selected_links)
         checkpoint(completed)
         logger.info("Saved %s of %s posts; errors: %s. Archive: %s",
                     len(post_records), len(selected_links), len(errors), output_dir / "index.html")
@@ -1567,6 +1854,56 @@ def run(args: argparse.Namespace) -> int:
         print((output_dir / "index.html").as_uri())
         open_export(output_dir / "index.html", args)
         return 0 if completed else 4
+
+
+def passive_reports(args, output_dir, session=None, links=None):
+    if args.dry_run or getattr(args, "_skip_insights", False):
+        return []
+    enabled = [kind for kind in REPORTS if getattr(args, kind, False)]
+    if not enabled:
+        return []
+    if session is not None:
+        save_details(session, output_dir, args.username)
+    if links is None:
+        links = getattr(args, "_selected_links", None)
+    if links is None:
+        cached = load_post_links(output_dir, args.username)
+        if args.oldest and not cached["completed"]:
+            raise ExportError("The cached timeline is incomplete; earliest posts cannot be identified for passive reports.")
+        offline_args = argparse.Namespace(**vars(args))
+        offline_args.offline, offline_args.refresh = True, False
+        links = select_post_links(filter_links_by_date(cached["links"], offline_args, requests.Session(), output_dir), args)
+    reports = generate_reports(output_dir, args.username, links, enabled, build_mode_label(args), full=args.mode == "full")
+    for title, filename, _ in reports:
+        logger.info("Saved passive report: %s", output_dir / filename)
+    return reports
+
+
+def run_posts_offline(args, output_dir):
+    cached = load_post_links(output_dir, args.username)
+    if not cached["links"]:
+        raise ExportError("No saved timeline. Use --output-dir to select the original collection folder.")
+    if args.oldest and not cached["completed"]:
+        raise ExportError("The cached timeline is incomplete; first run without --offline to identify the earliest posts.")
+    links = select_post_links(filter_links_by_date(cached["links"], args, requests.Session(), output_dir), args)
+    args._selected_links = links
+    state = read_json(export_state_path(output_dir)) or {}
+    if (state.get("job") or {}).get("username") != args.username:
+        state = {}
+    by_code = {record.get("shortcode"): record for record in state.get("post_records", [])}
+    records = [by_code[code] for url in links if (code := parse_shortcode_from_url(url)) in by_code]
+    reports = passive_reports(args, output_dir, links=links)
+    if state:
+        generate_html(state.get("profile") or {"username": args.username}, records, state.get("avatar_src") or "",
+                      build_mode_label(args), output_dir, args.batch_size,
+                      report_names=[kind for kind in REPORTS if getattr(args, kind, False)])
+        target = output_dir / "index.html"
+    elif reports:
+        target = output_dir / reports[0][1]
+    else:
+        raise ExportError("No cached post archive. Enable --analytics, --mentions, --contacts or --locations to analyze saved timeline data.")
+    open_export(target, args)
+    return 0
 
 
 
@@ -1584,7 +1921,9 @@ def main() -> int:
     ui = TerminalUI(quiet=args.quiet)
     logging.basicConfig(level=level, handlers=[ui], force=True)
     with ui:
-        return execute(args)
+        result = execute(args)
+        ui.finish(result)
+        return result
 
 
 def execute(args: argparse.Namespace) -> int:
@@ -1674,21 +2013,7 @@ def fetch_comments_page(
             "and pass it via --sessionid"
         )
 
-    if response.status_code == 429:
-        wait = 60
-        logger.warning("Rate limited (429) on comments. Waiting %ss ...", wait)
-        _safe_sleep(wait, jitter=0.1)
-        response = session.get(
-            f"{IG_BASE_URL}/api/v1/media/{media_id}/comments/",
-            params=params,
-            headers=COMMENTS_HEADERS,
-            timeout=30,
-            allow_redirects=False,
-        )
-        if response.status_code in (302, 303, 307, 401):
-            raise ExportError("Session expired or invalid (redirected to login after rate limit).")
-        if response.status_code == 429:
-            raise ExportError("Rate limited twice consecutively on comments. Aborting to protect your account.")
+    raise_if_rate_limited(response, "comments")
 
     response.raise_for_status()
     data = response.json()
@@ -1919,6 +2244,7 @@ def _session_is_valid(session: requests.Session) -> bool:
     response = session.get(f"{IG_BASE_URL}/api/v1/accounts/current_user/",
                            timeout=15, allow_redirects=False)
     try:
+        raise_if_rate_limited(response, "session validation")
         if response.status_code in (301, 302, 303, 307, 308, 400, 401, 403):
             return False
         response.raise_for_status()
@@ -1938,9 +2264,7 @@ def _fetch_csrftoken(session: requests.Session) -> str | None:
                 params={"client_version": "1"},
                 timeout=15,
             )
-            if resp.status_code == 429:
-                _safe_sleep(5, jitter=0.2)
-                continue
+            raise_if_rate_limited(resp, "session headers")
             csrf = session.cookies.get("csrftoken")
             if csrf:
                 return csrf
@@ -1952,10 +2276,10 @@ def _fetch_csrftoken(session: requests.Session) -> str | None:
     # Method 2: scrape from the main page
     try:
         resp = session.get(f"{IG_BASE_URL}/", timeout=20)
-        if resp.status_code != 429:
-            csrf = session.cookies.get("csrftoken")
-            if csrf:
-                return csrf
+        raise_if_rate_limited(resp, "session homepage")
+        csrf = session.cookies.get("csrftoken")
+        if csrf:
+            return csrf
     except requests.RequestException:
         pass
 
@@ -1977,12 +2301,14 @@ def run_comments(args: argparse.Namespace) -> int:
             raise ExportError("No saved interaction data in this folder; first collect without --offline.")
         session = requests.Session()
         links = select_post_links(filter_links_by_date(cached["links"], args, session, output_dir), args)
+        passive_reports(args, output_dir, links=links)
         if is_likes:
             return export_likers(args, session, output_dir, args.username, links)
         return export_cached_comments(args, output_dir, links)
     shared_links = getattr(args, "_selected_links", None)
     shared_session = getattr(args, "_shared_session", None)
     if shared_links is not None and shared_session is not None:
+        passive_reports(args, output_dir, shared_session, shared_links)
         if is_likes:
             return export_likers(args, shared_session, output_dir, args.username, shared_links)
         return export_comments(args, shared_session, output_dir, args.username, shared_links)
@@ -1998,6 +2324,8 @@ def run_comments(args: argparse.Namespace) -> int:
             _save_config({**{"sessionid": args.sessionid}})
             logger.info("Sessionid saved to %s", CONFIG_FILE)
         except ExportError as exc:
+            if is_rate_limited(exc):
+                raise
             logger.warning("Provided --sessionid is invalid: %s", exc)
 
     # 2. Try saved config
@@ -2009,6 +2337,8 @@ def run_comments(args: argparse.Namespace) -> int:
                 session = _session_from_sessionid(saved)
                 logger.debug("Using saved sessionid from %s", CONFIG_FILE)
             except ExportError as exc:
+                if is_rate_limited(exc):
+                    raise
                 logger.warning("Saved sessionid expired: %s", exc)
                 # Clear invalid sessionid so user is prompted for a fresh one
                 _save_config({})
@@ -2020,6 +2350,8 @@ def run_comments(args: argparse.Namespace) -> int:
                 if browser.is_logged_in():
                     session = browser.authenticated_session()
         except Exception as exc:
+            if is_rate_limited(exc):
+                raise
             logger.debug("Playwright failed: %s", exc)
 
     # 4. Prompt user interactively
@@ -2036,6 +2368,8 @@ def run_comments(args: argparse.Namespace) -> int:
                 _save_config({"sessionid": raw})
                 logger.info("Sessionid saved to %s", CONFIG_FILE)
             except ExportError as exc:
+                if is_rate_limited(exc):
+                    raise
                 logger.warning("Invalid sessionid: %s. Try again.", exc)
                 continue
         except (EOFError, KeyboardInterrupt):
@@ -2055,17 +2389,21 @@ def run_comments(args: argparse.Namespace) -> int:
         user_id = fetched_uid
         logger.info("Resolved @%s", profile["username"])
     except (ExportError, requests.RequestException) as exc:
+        if is_rate_limited(exc):
+            raise
         logger.warning("Could not resolve profile via API: %s", exc)
         # Fallback: HTML scrape + search API
         try:
-            scraped_profile, scraped_links, _, scraped_uid = _scrape_profile_html(args.username)
+            scraped_profile, scraped_links, _, scraped_uid = _scrape_profile_html(args.username, session=session)
             profile = scraped_profile or profile
             initial_links = scraped_links or initial_links
             user_id = user_id or scraped_uid
         except (ExportError, requests.RequestException) as inner:
+            if is_rate_limited(inner):
+                raise
             logger.debug("HTML scrape also failed: %s", inner)
         if not user_id:
-            user_id = _resolve_user_id_via_search(args.username) or user_id
+            user_id = _resolve_user_id_via_search(args.username, session=session) or user_id
 
     # Collect all post links
     username = profile["username"] if profile else args.username
@@ -2101,6 +2439,7 @@ def run_comments(args: argparse.Namespace) -> int:
         _save_debug_log(output_dir)
         return 0
 
+    passive_reports(args, output_dir, session, selected_links)
     if is_likes:
         return export_likers(args, session, output_dir, username, selected_links)
 
@@ -2129,7 +2468,7 @@ def export_comments(args, session, output_dir, username, selected_links):
             logger.error("Could not collect %s for %s: %s", "comments", shortcode, exc)
             errors.append(shortcode)
             update_progress("Comments", index, len(selected_links), "failed")
-            if "429" in str(exc) or "Rate limited" in str(exc):
+            if is_rate_limited(exc):
                 args._rate_limited = True
                 break
             continue
@@ -2262,7 +2601,7 @@ def export_likers(args, session, output_dir, username, selected_links):
                 store.mark(code, "failed", error=reason)
                 failed.append(code)
                 logger.error("%s: %s", code, reason)
-                if isinstance(exc, ExportError) and ("429" in str(exc) or "denied access" in str(exc)):
+                if is_rate_limited(exc) or (isinstance(exc, ExportError) and "denied access" in str(exc)):
                     args._rate_limited = True
                     break
         update_progress("Users who liked posts", len(codes), len(codes), "calculating statistics")
@@ -2279,14 +2618,13 @@ def export_likers(args, session, output_dir, username, selected_links):
                               "Not requested: collection stopped after Instagram denied or limited access.")
                 issues.append((code, reason))
         reasons = dict(issues)
-        with (output_dir / "likes-coverage.csv").open("w", encoding="utf-8-sig", newline="") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(["post_shortcode", "state", "reported_likes", "collected_users", "missing", "reason"])
+        def coverage_rows():
             for code, state in zip(codes, states):
-                expected = state.get("expected")
-                count = store.count(code)
-                writer.writerow([code, state["state"], expected if expected is not None else "", count,
-                                 max(0, expected-count) if expected is not None else "", reasons.get(code, "")])
+                expected, count = state.get("expected"), store.count(code)
+                yield {"post_shortcode": code, "state": state["state"], "reported_likes": expected,
+                       "collected_users": count, "missing": max(0, expected-count) if expected is not None else "",
+                       "reason": reasons.get(code, "")}
+        write_csv(output_dir / "likes-coverage.csv", ["post_shortcode", "state", "reported_likes", "collected_users", "missing", "reason"], coverage_rows())
         stats = store.stats()
         _save_likers_csv(store.rows(), output_dir)
         timeline = load_post_links(output_dir, username)
@@ -2315,41 +2653,71 @@ def export_cached_comments(args, output_dir, links):
 def run_full(args):
     root = ensure_output_dir(args.output_dir, args)
     phases = []
+    failure_reasons = []
     for mode, title, filename in (("full", "Posts", "index.html"), ("comments", "Commenters", "comments.html"), ("likes", "Likes", "likes.html")):
         phase = argparse.Namespace(**vars(args))
         phase.mode, phase.output_dir, phase.no_open = mode, str(root), True
+        phase._skip_insights = True
         # Reuse the timeline collected by the first phase rather than refreshing it three times.
         try:
             result = run(phase) if mode == "full" else run_comments(phase)
+        except (ExportError, requests.RequestException) as exc:
+            logger.error("%s: %s", title, exc)
+            failure_reasons.append(f"{title}: {exc}")
+            result = 2
+            phase._rate_limited = is_rate_limited(exc)
+        finally:
             if getattr(phase, "_shared_session", None) is not None:
                 args._shared_session = phase._shared_session
             if getattr(phase, "_selected_links", None) is not None:
                 args._selected_links = phase._selected_links
-        except (ExportError, requests.RequestException) as exc:
-            logger.error("%s: %s", title, exc)
-            result = 2
         phases.append((title, filename, result))
+        if mode == "full" and result and getattr(args, "_selected_links", None) is None:
+            logger.error("Commenters and likes skipped: the post timeline could not be collected.")
+            phases.extend([("Commenters (skipped: timeline unavailable)", "comments.html", 2),
+                           ("Likes (skipped: timeline unavailable)", "likes.html", 2)])
+            break
         if getattr(phase, "_rate_limited", False):
             logger.warning("Remaining phases postponed because Instagram limited access. Repeat full later.")
+            remaining = [("Commenters", "comments.html"), ("Likes", "likes.html")] if mode == "full" else [("Likes", "likes.html")] if mode == "comments" else []
+            phases.extend((name + " (skipped: Instagram limited access)", file, 2) for name, file in remaining)
             break
         if args.dry_run:
             return result
+    try:
+        if getattr(args, "_selected_links", None) is not None or not any(result for _, _, result in phases):
+            phases.extend(passive_reports(args, root, getattr(args, "_shared_session", None)))
+    except ExportError as exc:
+        logger.warning("Passive reports: %s", exc)
+        phases.append(("Passive reports", "analytics.html", 2))
+    state = read_json(export_state_path(root)) or {}
+    selected_links = getattr(args, "_selected_links", None)
+    if selected_links is not None and (state.get("job") or {}).get("username") == args.username and (root / "index.html").exists():
+        codes = {parse_shortcode_from_url(url) for url in selected_links}
+        records = [record for record in state.get("post_records", []) if record.get("shortcode") in codes]
+        # Keep the order chosen by --oldest/--limit, even for a cached subset.
+        by_code = {record["shortcode"]: record for record in records}
+        records = [by_code[code] for url in selected_links if (code := parse_shortcode_from_url(url)) in by_code]
+        generate_html(state.get("profile") or {"username": args.username}, records, state.get("avatar_src") or "",
+                      build_mode_label(args), root, args.batch_size,
+                      report_names=[kind for kind in REPORTS if getattr(args, kind, False)])
     rows = []
     for title, filename, result in phases:
         label = f'<a href="{filename}">{title}</a>' if (root / filename).exists() else title
         rows.append(f'<li>{label} — {"complete" if result == 0 else "partial or failed; see console and coverage"}</li>')
+    if failure_reasons:
+        rows.insert(0, "<li>Collection failed: " + "<br>".join(escape(reason) for reason in failure_reasons) + "</li>")
     path = root / "full.html"
     path.write_text('<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Full export</title><style>body{font:16px system-ui;margin:32px auto;padding:0 24px;max-width:960px}li{margin:16px 0}a{color:#c02e65}</style>' + f'<h1>Full export — @{escape(args.username)}</h1><ul>{"".join(rows)}</ul></html>', encoding="utf-8")
+    _save_debug_log(root)
     print(path.as_uri())
-    open_export(path, args)
+    if any(result == 0 for _, _, result in phases[:3]):
+        open_export(path, args)
     return 4 if any(result for _, _, result in phases) else 0
 
 
 def _save_likers_csv(records, output_dir: Path) -> None:
-    with (output_dir / "likes.csv").open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["post_shortcode", "user_id", "username", "full_name"])
-        writer.writeheader()
-        writer.writerows({key: record.get(key, "") for key in writer.fieldnames} for record in records)
+    write_csv(output_dir / "likes.csv", ["post_shortcode", "user_id", "username", "full_name"], records)
 
 
 def _save_participant_stats(stats: dict[str, Any], output_dir: Path, kind: str) -> None:
@@ -2359,9 +2727,7 @@ def _save_participant_stats(stats: dict[str, Any], output_dir: Path, kind: str) 
         fields = fields[:3]
     else:
         fields += ["likes_received", "last_comment_at"]
-    with (output_dir / f"{kind}-stats.csv").open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
-        writer.writeheader()
+    def rows():
         for user in stats["participants"]:
             row = {"username": user["username"], "full_name": user["full_name"],
                    fields[2]: user["count"]}
@@ -2369,7 +2735,8 @@ def _save_participant_stats(stats: dict[str, Any], output_dir: Path, kind: str) 
                 row["posts_commented"] = user["posts_commented"]
                 timestamp = user["last_comment_ts"]
                 row.update(likes_received=user["likes_received"], last_comment_at=datetime.fromtimestamp(timestamp, UTC).isoformat() if timestamp else "")
-            writer.writerow(row)
+            yield row
+    write_csv(output_dir / f"{kind}-stats.csv", fields, rows())
 
 
 def _save_comments_csv(records: list[dict[str, Any]], output_dir: Path) -> None:
@@ -2378,12 +2745,7 @@ def _save_comments_csv(records: list[dict[str, Any]], output_dir: Path) -> None:
         "post_shortcode", "username", "full_name", "text",
         "created_at", "like_count", "child_comment_count", "comment_id",
     ]
-    with path.open("w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for rec in records:
-            row = {k: rec.get(k, "") for k in fieldnames}
-            writer.writerow(row)
+    write_csv(path, fieldnames, records)
     logger.info("CSV saved to %s (UTF-8 BOM)", path)
 
 

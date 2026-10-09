@@ -78,6 +78,12 @@ class TerminalUI(logging.Handler):
         self.progress.update(self.task, description=stage + (f" · {detail}" if detail else ""), total=total or None, completed=current)
         self.render()
 
+    def finish(self, result):
+        self.progress.update(self.task, description="Completed" if result == 0 else "Stopped · incomplete or failed")
+        self.progress.stop_task(self.task)
+        self.progress.columns = (TextColumn(""), *self.progress.columns[1:])
+        self.render()
+
 
 def update_progress(stage, current, total=None, detail=""):
     global _LAST_LOG

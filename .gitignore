@@ -5,5 +5,6 @@ exports/
 dist/
 build/
 output/
+.playwright-cli/
 *.egg-info/
 .chrome-profile/

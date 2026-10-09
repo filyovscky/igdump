@@ -12,6 +12,32 @@ import insta_html_export as app
 
 
 class CommandTests(unittest.TestCase):
+    def test_profile_urls_match_usernames_for_every_command(self):
+        values = ('@natgeo', 'natgeo', 'https://instagram.com/natgeo',
+                  'https://www.instagram.com/natgeo/', 'http://instagram.com/natgeo/',
+                  'https://m.instagram.com/natgeo/?igsh=tracking#profile',
+                  'www.instagram.com/natgeo/', 'https://WWW.INSTAGRAM.COM/natgeo/')
+        for mode in ('posts', 'comments', 'likes', 'full', 'all', 'oldest', 'likers'):
+            flags = ['--limit', '2'] if mode == 'oldest' else []
+            expected = app.parse_args([mode, '@natgeo', *flags])
+            for value in values:
+                with self.subTest(mode=mode, value=value):
+                    actual = app.parse_args([mode, value, *flags])
+                    self.assertEqual(vars(actual), vars(expected))
+                    self.assertEqual(app.build_job_slug(actual), app.build_job_slug(expected))
+
+    def test_invalid_profile_urls_are_rejected(self):
+        for value in ('https://instagram.com/p/ABC/', 'https://instagram.com/reel/ABC/',
+                      'https://instagram.com/stories/natgeo/123/', 'https://instagram.com/explore/',
+                      'https://instagram.com/', 'https://instagram.com/natgeo/extra',
+                      'https://instagram.com.evil.org/natgeo/', 'https://example.com/natgeo/',
+                      'https://instagram.com@evil.org/natgeo/', 'https://user@instagram.com/natgeo/',
+                      'ftp://instagram.com/natgeo/', 'https://instagram.com:443/natgeo/',
+                      'https://instagra,.com/natgeo/', 'https://[invalid/natgeo/',
+                      'https://instagram.com/name with spaces/'):
+            with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                app.parse_args(['posts', value])
+
     def test_selection_is_shared_by_all_content_commands(self):
         links = ["new", "middle", "old"]
         for mode in ("posts", "comments", "likes", "full"):
@@ -46,7 +72,7 @@ class CommandTests(unittest.TestCase):
                 ("--sessionid", mode in ("comments", "likes")),
                 ("--comment-delay", mode in ("comments", "full")),
                 ("--like-delay", mode in ("likes", "full")),
-                ("--offline", mode in ("comments", "likes")),
+                ("--offline", True),
             ):
                 with self.subTest(mode=mode, flag=flag):
                     self.assertEqual(flag in out.getvalue(), supported)
@@ -81,7 +107,7 @@ class CommandTests(unittest.TestCase):
             ["oldest", "natgeo"],
             ["comments", "natgeo", "--limit", "-1"],
             ["all", "natgeo", "--batch-size", "0"],
-            ["all", "https://instagram.com/natgeo"],
+            ["all", "https://instagram.com/p/ABC/"],
             ["all", "natgeo", "--quiet", "--verbose"],
             ["comments", "natgeo", "--comment-delay", "nan"],
             ["comments", "natgeo", "--comment-delay", "-1"],

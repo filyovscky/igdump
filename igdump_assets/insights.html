@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>$title</title>
+<style>
+:root {color-scheme:light dark;--bg:#fff;--fg:#202020;--muted:#606060;--line:#dedede;--accent:#c02e65}
+* {box-sizing:border-box} body {margin:0;background:var(--bg);color:var(--fg);font:16px system-ui,sans-serif}
+main {max-width:1100px;margin:auto;padding:32px 24px 64px} h1 {font-size:26px;margin:0 0 12px} h2 {font-size:20px;margin:32px 0 16px}
+p {line-height:1.6} .meta {color:var(--muted)} nav {display:flex;gap:16px;flex-wrap:wrap;margin:20px 0}
+a {color:var(--accent);text-decoration:none} a:hover {text-decoration:underline} a:focus-visible {outline:2px solid currentColor;outline-offset:3px}
+.table-scroll {overflow:auto} table {width:100%;border-collapse:collapse} th,td {text-align:left;padding:10px 8px;border-bottom:1px solid var(--line);vertical-align:top;overflow-wrap:anywhere} th {color:var(--muted);font-weight:600}
+.heatmap {min-width:900px;font-size:12px;font-variant-numeric:tabular-nums}.heatmap th,.heatmap td {text-align:center;padding:8px 4px}.heatmap td {color:var(--fg);border:2px solid var(--bg)}
+.bars {display:grid;gap:8px}.bar-row {display:grid;grid-template-columns:100px minmax(80px,1fr) 48px;gap:12px;align-items:center;font-variant-numeric:tabular-nums}.bar-track {height:18px;border-bottom:1px solid var(--line)}.bar {height:100%;background:var(--accent)}
+.coordinate-map {display:block;max-width:100%;width:720px;border:1px solid var(--line)}.map-grid {fill:none;stroke:var(--line);stroke-width:1}.coordinate-map circle {fill:var(--accent);stroke:var(--bg);stroke-width:1}
+.contacts-table {table-layout:fixed;min-width:940px}.contacts-table .caption-text {white-space:pre-wrap;max-height:14em;overflow:auto;padding-right:8px}
+select,button {font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--line);padding:6px 10px}button {cursor:pointer}button:focus-visible,select:focus-visible {outline:2px solid var(--accent);outline-offset:2px}
+#street-map {height:480px;width:100%;border:1px solid var(--line)}[hidden] {display:none!important}.leaflet-container a {color:#c02e65}
+.report-controls {display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:20px 0}.coordinate-map {width:100%;height:480px;background:var(--bg);touch-action:none}.map-land {fill:var(--line);stroke:var(--muted);stroke-width:.5;fill-rule:evenodd}.map-land path {vector-effect:non-scaling-stroke}.coordinate-map circle {vector-effect:non-scaling-stroke}.coordinate-map text {fill:var(--fg);font-size:5px}.map-note {color:var(--muted)}
+@media(prefers-color-scheme:dark) {:root {--bg:#121212;--fg:#e4e4e4;--muted:#aaa;--line:#333;--accent:#ff80ad}}
+.location-pin {cursor:pointer}.location-pin:focus-visible circle {stroke:var(--fg);stroke-width:2}.coordinate-map .pin-date {stroke:var(--bg);paint-order:stroke;pointer-events:none}.hide-pin-dates .pin-date-tooltip {display:none}.pin-date-tooltip {color:#202020;background:#fff}.pin-details p {margin:8px 0;line-height:1.5}
+@media(max-width:600px) {main {padding:24px 16px}.bar-row {grid-template-columns:80px minmax(50px,1fr) 36px;gap:8px}}
+@media print {nav {display:none}main {max-width:none;padding:0}.table-scroll {overflow:visible}.heatmap {min-width:0;font-size:8px}th,td {padding:5px} .bar,.heatmap td {print-color-adjust:exact}}
+</style>
+<main>
+<h1>$title</h1>
+<p class="meta">$selection · Passive analysis of saved publication data.</p>
+<p>$coverage</p>
+<nav>$navigation<a href="$kind.csv">CSV</a><a href="$kind.json">JSON</a></nav>
+$body
+</main>
+</html>

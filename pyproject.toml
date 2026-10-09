@@ -17,8 +17,8 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["insta_html_export", "igdump_storage", "igdump_dates", "igdump_progress"]
+py-modules = ["insta_html_export", "igdump_storage", "igdump_dates", "igdump_progress", "igdump_csv", "igdump_insights"]
 packages = ["igdump_assets"]
 
 [tool.setuptools.package-data]
-igdump_assets = ["*.html"]
+igdump_assets = ["*.html", "*.js", "*.css", "*.json", "*.txt"]
