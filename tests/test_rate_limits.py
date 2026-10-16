@@ -11,6 +11,27 @@ from igdump_progress import TerminalUI
 
 
 class RateLimitTests(unittest.TestCase):
+    def test_browser_profile_recovers_avatar_and_counts_for_target_only(self):
+        session = requests.Session()
+        browser = MagicMock()
+        page = browser.open_page.return_value
+        page.url = app.IG_BASE_URL + '/oddnesse/'
+        page.text_content.return_value = 'oddnesse'
+        page.content.return_value = '<script>' + json.dumps({'users': [
+            {'username': 'viewer', 'id': '999', 'profile_pic_url': 'https://cdn.example/wrong.jpg'},
+            {'username': 'oddnesse', 'id': '123', 'profile_pic_url_hd': 'https://cdn.example/right.jpg', 'media_count': 112, 'follower_count': 500, 'full_name': 'Target'}]}) + '</script>'
+        with patch.object(app, 'fetch_profile_info', side_effect=app.ProfileHTMLUnavailableError('login')):
+            profile, _, _, uid = app.resolve_profile_for_posts(session, browser, 'oddnesse')
+        self.assertEqual(uid, '123')
+        self.assertEqual(profile['avatar_url'], 'https://cdn.example/right.jpg')
+        self.assertEqual(profile['mediacount'], 112)
+        self.assertEqual(profile['followers'], 500)
+
+    def test_profile_avatar_from_metadata_handles_attribute_order_and_escaping(self):
+        html = '<meta content="https://cdn.example/avatar.jpg?a=1&amp;b=2" property="og:image">'
+        self.assertEqual(app.profile_metadata_from_html(html, 'oddnesse')['avatar_url'], 'https://cdn.example/avatar.jpg?a=1&b=2')
+        self.assertEqual(app.profile_metadata_from_html('<script>{"username":"viewer","profile_pic_url":"https://cdn.example/wrong.jpg"}</script>', 'oddnesse'), {})
+
     @staticmethod
     def timeline_payload(errors=None):
         return {'data': {'xdt_api__v1__feed__user_timeline_graphql_connection': {
@@ -39,6 +60,53 @@ class RateLimitTests(unittest.TestCase):
         self.assertIn('doc_id=observed-id', args['body'])
         self.assertIn('next', args['body'])
         self.assertNotIn('cookie', args['headers'])
+
+    def test_missing_pagination_template_is_observed_before_any_guessed_request(self):
+        session = requests.Session()
+        session._igdump_timeline_page = MagicMock()
+        session._igdump_timeline_templates = {'first': {'form': {'doc_id': 'first-only'}}}
+        expected = (['https://www.instagram.com/p/B/'], 'next', True)
+        with patch.object(app, 'observe_browser_pagination', return_value=expected) as observe, patch.object(session, 'post', side_effect=AssertionError('guessed query')):
+            self.assertEqual(app._try_graphql_timeline(session, 'oddnesse', 'first-cursor'), expected)
+        observe.assert_called_once_with(session, 'oddnesse', 'first-cursor')
+
+    def test_browser_scroll_captures_real_next_page_and_removes_listener(self):
+        session = requests.Session()
+        page = MagicMock()
+        session._igdump_timeline_page = page
+        response = MagicMock(url=app.IG_BASE_URL + '/graphql/query/', status=200)
+        response.request.post_data = app.urlencode({'doc_id': 'next-only', 'variables': json.dumps({'username': 'oddnesse', 'after': 'first-cursor'})})
+        response.json.return_value = self.timeline_payload()
+        response.request.all_headers.return_value = {'cookie': 'private', 'x-fb-lsd': 'token'}
+        def respond(_):
+            callback = page.context.on.call_args.args[1]
+            callback(response)
+        page.wait_for_timeout.side_effect = respond
+        self.assertEqual(app.observe_browser_pagination(session, 'oddnesse', 'first-cursor')[0], ['https://www.instagram.com/p/A/'])
+        self.assertEqual(session._igdump_timeline_templates['next']['form']['doc_id'], 'next-only')
+        self.assertNotIn('cookie', session._igdump_timeline_templates['next']['headers'])
+        page.context.remove_listener.assert_called_once()
+
+    def test_rest_fallback_starts_fresh_and_resumes_with_its_own_cursor(self):
+        session = requests.Session()
+        error = requests.HTTPError('400')
+        with patch.object(app, '_try_graphql_timeline', side_effect=error) as graphql, patch.object(app, 'fetch_user_timeline_rest', side_effect=[(['A'], 'rest-next', True), (['B'], None, False)]) as rest:
+            first = app.fetch_authenticated_timeline_page(session, 'oddnesse', 'graphql-cursor', '123')
+            self.assertEqual(first, (['A'], 'igdump-rest:rest-next', True))
+            rest.assert_called_once_with(session, '123', None)
+            self.assertEqual(app.fetch_authenticated_timeline_page(session, 'oddnesse', first[1], '123'), (['B'], None, False))
+            self.assertEqual(rest.call_args.args, (session, '123', 'rest-next'))
+            graphql.assert_called_once()
+
+    def test_browser_pagination_429_never_falls_back_to_rest(self):
+        session = requests.Session()
+        session._igdump_timeline_page = MagicMock()
+        session._igdump_timeline_templates = {'first': {}}
+        session._igdump_browser_timeline_limited = True
+        with patch.object(app, 'fetch_user_timeline_rest') as rest:
+            with self.assertRaises(app.InstagramRateLimitError):
+                app.fetch_authenticated_timeline_page(session, 'oddnesse', 'next', '123')
+        rest.assert_not_called()
 
     def test_location_picture_errors_do_not_discard_valid_timeline(self):
         payload = self.timeline_payload([{'path': ['xdt_api__v1__feed__user_timeline_graphql_connection', 'edges', 0, 'node', 'location', 'profile_pic_url']}])

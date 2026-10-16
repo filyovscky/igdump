@@ -440,6 +440,30 @@ class ExportTests(unittest.TestCase):
             self.assertTrue((Path(directory) / "avatar-placeholder.svg").exists())
             self.assertEqual(generate.call_args.kwargs["post_records"], [{"shortcode": "A"}])
 
+    def test_placeholder_avatar_is_replaced_when_profile_picture_becomes_available(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'avatar-placeholder.svg').write_text('placeholder', encoding='utf-8')
+            args = app.parse_args(['posts', 'natgeo', '--output-dir', directory, '--no-open'])
+            avatar = root / 'avatar.jpg'
+            avatar.write_bytes(b'image')
+            with patch.object(app, 'InstagramBrowser'), patch.object(app, 'preflight_instagram_access'), patch.object(app, 'fetch_profile_info', return_value=({'username': 'natgeo', 'avatar_url': 'https://cdn.example/avatar.jpg'}, [], None, '123')), patch.object(app, 'fetch_authenticated_timeline_page', return_value=([], None, False)), patch.object(app, 'load_export_state', return_value={'avatar_src': 'avatar-placeholder.svg'}), patch.object(app, 'download_binary', return_value=avatar) as download, patch.object(app, 'generate_html'), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(app.run(args), 0)
+            download.assert_called_once()
+            self.assertEqual(app.read_json(root / '.export-state.json')['avatar_src'], 'avatar.jpg')
+
+    def test_first_page_is_checkpointed_before_pagination_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = app.parse_args(['posts', 'natgeo'])
+            with patch.object(app, 'fetch_authenticated_timeline_page', side_effect=app.ExportError('next page failed')):
+                with self.assertRaises(app.ExportError):
+                    app.collect_post_links(requests.Session(), 'natgeo', 50, root, args, ['first'], 'graphql-cursor', '123')
+            state = app.load_post_links(root, 'natgeo')
+            self.assertEqual(state['links'], ['first'])
+            self.assertEqual(state['cursor'], 'graphql-cursor')
+            self.assertFalse(state['completed'])
+
     def test_interrupted_download_is_not_reused(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory) / "post"

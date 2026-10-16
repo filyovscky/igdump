@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 from collections import deque
 from urllib.parse import urlparse, parse_qs, urlencode
+from html.parser import HTMLParser
 from string import Template
 
 # ── Debug log (structured, AI-readable) ──────────────────────────────────────
@@ -744,6 +745,7 @@ def _scrape_profile_html(username: str, session=None) -> tuple[dict[str, Any], l
                 "followees": (user_obj.get("edge_follow") or {}).get("count"),
                 "avatar_url": user_obj.get("profile_pic_url_hd") or user_obj.get("profile_pic_url") or "",
             }
+            profile.update(profile_metadata_from_html(text, username))
             _debug_event("profile.init_state_ok", f"links={len(links)}, uid={uid!r}", links_count=len(links), uid=uid or None)
             if not uid:
                 uid = _extract_user_id_from_html(text, username) or _resolve_user_id_via_search(username, session=sess)
@@ -779,6 +781,7 @@ def _scrape_profile_html(username: str, session=None) -> tuple[dict[str, Any], l
         "followees": None,
         "avatar_url": "",
     }
+    profile.update(profile_metadata_from_html(text, username))
     _debug_event("profile.regex_fallback", f"links={len(links)}, uid={uid!r}", links_count=len(links), uid=uid or None)
 
     # 3. If still no user_id, try search API
@@ -786,6 +789,67 @@ def _scrape_profile_html(username: str, session=None) -> tuple[dict[str, Any], l
         uid = _resolve_user_id_via_search(username, session=sess)
 
     return profile, links, None, uid
+
+
+def profile_metadata_from_user(user, username):
+    if not isinstance(user, dict) or str(user.get("username", "")).casefold() != username.casefold():
+        return {}
+    result = {}
+    for key in ("full_name", "biography"):
+        if isinstance(user.get(key), str) and user[key]:
+            result[key] = user[key]
+    avatar = user.get("hd_profile_pic_url_info")
+    avatar = avatar.get("url") if isinstance(avatar, dict) else None
+    avatar = avatar or user.get("profile_pic_url_hd") or user.get("profile_pic_url")
+    if isinstance(avatar, str) and urlparse(avatar).scheme in ("https", "http"):
+        result["avatar_url"] = avatar
+    for dest, direct, nested in (("mediacount", "media_count", "edge_owner_to_timeline_media"),
+                                 ("followers", "follower_count", "edge_followed_by"),
+                                 ("followees", "following_count", "edge_follow")):
+        value = user.get(direct)
+        if value is None and isinstance(user.get(nested), dict):
+            value = user[nested].get("count")
+        if isinstance(value, int) and not isinstance(value, bool):
+            result[dest] = value
+    return result
+
+
+def profile_metadata_from_html(text, username):
+    """Read target-account fields already embedded in public or browser HTML."""
+    result = {}
+    def visit(value):
+        if isinstance(value, dict):
+            result.update(profile_metadata_from_user(value, username))
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+        elif isinstance(value, str) and value.lstrip().startswith(("{", "[")):
+            try:
+                visit(json.loads(value))
+            except (ValueError, RecursionError):
+                pass
+    for script in re.findall(r'<script[^>]*>(.*?)</script>', text, re.DOTALL):
+        try:
+            visit(json.loads(script))
+        except (ValueError, RecursionError):
+            pass
+    for variant in (text, text.replace('\\"', '"')):
+        for candidate in re.findall(r'\{[^{}]*"username"\s*:\s*"' + re.escape(username) + r'"[^{}]*\}', variant, re.I):
+            try:
+                result.update(profile_metadata_from_user(json.loads(candidate), username))
+            except ValueError:
+                pass
+    class ProfileMeta(HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            if tag == "meta" and attrs.get("property", "").lower() == "og:image" and not result.get("avatar_url"):
+                value = attrs.get("content") or ""
+                if urlparse(value).scheme in ("http", "https"):
+                    result["avatar_url"] = value
+    ProfileMeta().feed(text)
+    return result
 
 
 def _extract_user_id_from_html(text: str, username: str | None = None) -> str:
@@ -971,6 +1035,66 @@ def fetch_profile_info(session: requests.Session, username: str) -> tuple[dict[s
     return profile, initial_links, end_cursor, user_id
 
 
+def capture_browser_timeline(session, username, response):
+    """Keep the actual browser query and its response, scoped to this profile."""
+    if "/graphql/query" not in response.url:
+        return
+    try:
+        form = {key: values[-1] for key, values in parse_qs(response.request.post_data or "", keep_blank_values=True).items()}
+        variables = json.loads(form.get("variables", "{}"))
+        if variables.get("username", "").casefold() != username.casefold():
+            return
+        if response.status == 429:
+            session._igdump_browser_timeline_limited = True
+            return
+        if response.status != 200:
+            return
+        payload = response.json()
+        media = (payload.get("data") or {}).get("xdt_api__v1__feed__user_timeline_graphql_connection")
+        if not isinstance(media, dict) or not form.get("doc_id"):
+            return
+        metadata = getattr(session, "_igdump_browser_profile_metadata", {})
+        for user in [media.get("user"), *((edge.get("node") or {}).get("user") for edge in media.get("edges", []))]:
+            metadata.update(profile_metadata_from_user(user, username))
+        session._igdump_browser_profile_metadata = metadata
+        pages = getattr(session, "_igdump_timeline_pages", {})
+        pages[variables.get("after")] = payload
+        session._igdump_timeline_pages = pages
+        templates = getattr(session, "_igdump_timeline_templates", {})
+        templates["next" if variables.get("after") else "first"] = {
+            "form": form, "variables": variables,
+            "headers": {key: value for key, value in response.request.all_headers().items()
+                        if key.lower() not in ("cookie", "host", "content-length", "accept-encoding")},
+        }
+        session._igdump_timeline_templates = templates
+    except (ValueError, TypeError, PlaywrightError):
+        return
+
+
+def observe_browser_pagination(session, username, after_cursor):
+    """Let Instagram generate its current pagination query instead of guessing it."""
+    page = getattr(session, "_igdump_timeline_page", None)
+    if page is None:
+        return None
+    def capture(response):
+        capture_browser_timeline(session, username, response)
+    page.context.on("response", capture)
+    try:
+        for _ in range(8):
+            page.mouse.wheel(0, 1800)
+            page.wait_for_timeout(1000)
+            if getattr(session, "_igdump_browser_timeline_limited", False):
+                raise InstagramRateLimitError("Instagram rate limited browser timeline pagination (429). Cached progress is preserved.")
+            pages = getattr(session, "_igdump_timeline_pages", {})
+            if after_cursor in pages:
+                return _parse_timeline_payload(session, username, pages.pop(after_cursor))
+            if "next" in getattr(session, "_igdump_timeline_templates", {}):
+                break
+        return None
+    finally:
+        page.context.remove_listener("response", capture)
+
+
 def resolve_profile_for_posts(session, browser, username):
     try:
         profile, links, cursor, uid = fetch_profile_info(session, username)
@@ -986,29 +1110,7 @@ def resolve_profile_for_posts(session, browser, username):
     logger.warning("Profile ID unavailable in public HTML. Reading the logged-in Chrome profile page ...")
     context = browser.require_context()
     def capture(response):
-        if "/graphql/query" not in response.url or response.status != 200:
-            return
-        try:
-            form = {key: values[-1] for key, values in parse_qs(response.request.post_data or "", keep_blank_values=True).items()}
-            variables = json.loads(form.get("variables", "{}"))
-            if variables.get("username", "").casefold() != username.casefold():
-                return
-            payload = response.json()
-            media = (payload.get("data") or {}).get("xdt_api__v1__feed__user_timeline_graphql_connection")
-            if not isinstance(media, dict) or not form.get("doc_id"):
-                return
-            pages = getattr(session, "_igdump_timeline_pages", {})
-            pages[variables.get("after")] = payload
-            session._igdump_timeline_pages = pages
-            templates = getattr(session, "_igdump_timeline_templates", {})
-            templates["next" if variables.get("after") else "first"] = {
-                "form": form, "variables": variables,
-                "headers": {key: value for key, value in response.request.all_headers().items()
-                            if key.lower() not in ("cookie", "host", "content-length", "accept-encoding")},
-            }
-            session._igdump_timeline_templates = templates
-        except (ValueError, TypeError, PlaywrightError):
-            return
+        capture_browser_timeline(session, username, response)
     context.on("response", capture)
     page = browser.open_page(f"{IG_BASE_URL}/{username}/")
     try:
@@ -1016,11 +1118,23 @@ def resolve_profile_for_posts(session, browser, username):
         assert_page_is_usable(page, f"{IG_BASE_URL}/{username}/")
         if "Please wait a few minutes before you try again" in (page.text_content("body") or ""):
             raise InstagramRateLimitError("Instagram limited the authenticated profile page. Cached data is preserved.")
-        uid = _extract_user_id_from_html(page.content(), username)
+        html = page.content()
+        uid = _extract_user_id_from_html(html, username)
         if not uid:
             uid = _resolve_user_id_via_search(username, session=session)
         if not uid:
             raise ExportError(f"Could not identify @{username}: public HTML and the logged-in Chrome page supplied no profile ID.")
+        metadata = getattr(session, "_igdump_browser_profile_metadata", {})
+        profile.update(metadata)
+        profile.update(profile_metadata_from_html(html, username))
+        if not profile.get("avatar_url"):
+            avatar = page.evaluate("""username => {
+                const image = [...document.querySelectorAll('img[alt]')].find(img =>
+                    img.alt.toLowerCase() === `${username.toLowerCase()}'s profile picture`);
+                return image ? image.currentSrc || image.src : null;
+            }""", username)
+            if isinstance(avatar, str) and urlparse(avatar).scheme in ("http", "https"):
+                profile["avatar_url"] = avatar
         _debug_event("profile.browser_ok", "Profile ID from authenticated page", username=username, uid=uid)
         templates = getattr(session, "_igdump_timeline_templates", None)
         if isinstance(templates, dict) and templates:
@@ -1118,6 +1232,14 @@ def _try_graphql_timeline(
     templates = getattr(session, "_igdump_timeline_templates", {})
     if not isinstance(templates, dict):
         templates = {}
+    if after_cursor and "next" not in templates and getattr(session, "_igdump_timeline_page", None) is not None:
+        logger.info("Reading the pagination query generated by the logged-in Chrome page ...")
+        observed = observe_browser_pagination(session, username, after_cursor)
+        if observed is not None:
+            return observed
+        templates = getattr(session, "_igdump_timeline_templates", {})
+        if "next" not in templates:
+            raise ExportError("The Chrome profile page did not supply a pagination query.")
     template = templates.get("next" if after_cursor else "first")
     form = {
         "variables": json.dumps(variables, separators=(",", ":")),
@@ -1207,7 +1329,14 @@ def fetch_authenticated_timeline_page(
     The REST fallback requires *user_id* (numeric ID of the profile owner).
     Retries once on transient errors.
     """
-    for retry in range(2):
+    # Cursors belong to the API that produced them. Persist the transport in
+    # the saved cursor so resuming a REST scan never sends its token to GraphQL.
+    rest_prefix = "igdump-rest:"
+    rest_cursor = None
+    use_rest = isinstance(after_cursor, str) and after_cursor.startswith(rest_prefix)
+    if use_rest:
+        rest_cursor = after_cursor[len(rest_prefix):]
+    for retry in range(0 if use_rest else 2):
         try:
             _debug_event("timeline.method", "Trying GraphQL", username=username)
             return _try_graphql_timeline(session, username, after_cursor)
@@ -1220,6 +1349,8 @@ def fetch_authenticated_timeline_page(
                 continue
             logger.warning("GraphQL failed (%s). Trying REST fallback ...", exc)
             _debug_event("timeline.fallback", f"GraphQL → REST: {exc}", username=username, user_id=user_id)
+            if after_cursor:
+                logger.info("Starting REST timeline from its first page; GraphQL cursors cannot be reused. Saved links will be deduplicated.")
             break
 
     # Fall back to REST if we have user_id
@@ -1227,7 +1358,8 @@ def fetch_authenticated_timeline_page(
         for retry in range(2):
             try:
                 _debug_event("timeline.method", "Trying REST", user_id=user_id)
-                return fetch_user_timeline_rest(session, user_id, after_cursor)
+                links, cursor, more = fetch_user_timeline_rest(session, user_id, rest_cursor)
+                return links, rest_prefix + cursor if cursor else None, more
             except requests.RequestException as exc:
                 if is_rate_limited(exc):
                     raise
@@ -1277,6 +1409,7 @@ def collect_post_links(
         logger.info("Resuming pagination from %s cached links, cursor=%s", len(links), "<saved>" if cached_cursor else "<fresh>")
 
     seen_cursors: set[str] = {cursor} if cursor else set()
+    save_post_links(output_dir, args, links, total_available, completed=False, cursor=cursor)
 
     while True:
         page_links, next_cursor, _has_next = fetch_authenticated_timeline_page(session, username, cursor, user_id=user_id)
@@ -1767,7 +1900,7 @@ def run(args: argparse.Namespace) -> int:
         }
 
         avatar_name = state.get("avatar_src") if isinstance(state.get("avatar_src"), str) else None
-        if avatar_name and (output_dir / avatar_name).exists():
+        if avatar_name and avatar_name != "avatar-placeholder.svg" and (output_dir / avatar_name).exists():
             avatar_file = output_dir / avatar_name
         else:
             avatar_url = profile.get("avatar_url")
