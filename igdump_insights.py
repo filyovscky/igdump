@@ -14,7 +14,7 @@ from string import Template
 from urllib.parse import urlsplit, urlunsplit
 
 from igdump_csv import write_csv
-from igdump_storage import read_json, write_json
+from igdump_storage import read_json, write_json, atomic_write, PostStore
 
 REPORTS = {"analytics": "Publication analytics", "mentions": "Mentioned and tagged accounts",
            "contacts": "Contacts in captions", "locations": "Publication locations"}
@@ -111,8 +111,11 @@ def cached_details(root: Path, username: str, links: list[str]):
     records = cached.get("posts", {}) if cached.get("username", "").lower() == username.lower() else {}
     records = {code: dict(value) for code, value in records.items() if isinstance(value, dict)} if isinstance(records, dict) else {}
     state = read_json(root / ".export-state.json") or {}
+    if (root / '.posts.sqlite').exists():
+        with PostStore(root / '.posts.sqlite', username) as store:
+            state = {**state, 'job': {'username': username}, 'archive_records': store.records()}
     if (state.get("job") or {}).get("username", "").lower() == username.lower():
-        for old in state.get("post_records", []):
+        for old in state.get("archive_records", state.get("post_records", [])):
             code = old.get("shortcode")
             if code:
                 row = {**publication_details(old), **records.get(code, {})}
@@ -409,6 +412,6 @@ def generate_reports(root: Path, username: str, links: list[str], enabled: list[
                 nav += f'<a href="{filename}">{label}</a>'
         html = template.substitute(title=escape(f'{title} — @{username}'), selection=escape(selection),
             coverage=escape(coverage), navigation=nav, kind=kind, body=body or '<p>No matches in the available data.</p>')
-        (root / f'{kind}.html').write_text(html, encoding='utf-8')
+        atomic_write(root / f'{kind}.html', html)
         reports.append((title, f'{kind}.html', 0))
     return reports

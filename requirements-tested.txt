@@ -1,0 +1,14 @@
+# Tested on Windows / Python 3.13. Use as constraints: pip install -c requirements-tested.txt -e .
+certifi==2026.10.18
+charset-normalizer==3.5.2
+greenlet==3.5.6
+idna==3.20
+markdown-it-py==4.2.0
+mdurl==0.1.2
+playwright==1.64.0
+pyee==14.0.0
+Pygments==2.21.0
+requests==2.34.2
+rich==15.0.0
+typing_extensions==4.16.0
+urllib3==2.8.0

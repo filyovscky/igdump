@@ -61,6 +61,54 @@ class RateLimitTests(unittest.TestCase):
         self.assertIn('next', args['body'])
         self.assertNotIn('cookie', args['headers'])
 
+    def test_api_graphql_endpoint_is_captured_and_replayed_without_rewriting_url(self):
+        session = requests.Session()
+        page = MagicMock()
+        session._igdump_timeline_page = page
+        response = MagicMock(url=app.IG_BASE_URL+'/api/graphql', status=200)
+        response.request.post_data = app.urlencode({'doc_id':'observed', 'variables':json.dumps({'username':'oddnesse','after':'cursor'})})
+        response.request.all_headers.return_value = {'x-fb-lsd':'dummy'}
+        response.json.return_value = self.timeline_payload()
+        app.capture_browser_timeline(session, 'oddnesse', response)
+        self.assertIn('cursor', session._igdump_timeline_pages)
+        page.evaluate.return_value = {'status':200,'body':json.dumps(self.timeline_payload())}
+        with patch.object(session,'post',side_effect=AssertionError('wrong transport')):
+            app._try_graphql_timeline(session,'oddnesse','another-cursor')
+        self.assertEqual(page.evaluate.call_args.args[1]['url'],app.IG_BASE_URL+'/api/graphql')
+
+    def test_profile_waits_for_delayed_api_graphql_response_before_closing_page(self):
+        session = requests.Session()
+        browser = MagicMock()
+        page = browser.open_page.return_value
+        page.url = app.IG_BASE_URL+'/oddnesse/'
+        page.text_content.return_value = 'oddnesse'
+        page.content.return_value = '<script>{"username":"oddnesse","id":"123"}</script>'
+        response = MagicMock(url=app.IG_BASE_URL+'/api/graphql', status=200)
+        response.request.post_data = app.urlencode({'doc_id':'observed','variables':json.dumps({'username':'oddnesse'})})
+        response.request.all_headers.return_value = {}
+        response.json.return_value = self.timeline_payload()
+        def delayed(milliseconds):
+            if milliseconds == 500:
+                browser.require_context().on.call_args.args[1](response)
+        page.wait_for_timeout.side_effect = delayed
+        with patch.object(app,'fetch_profile_info',side_effect=app.ProfileHTMLUnavailableError('login')):
+            app.resolve_profile_for_posts(session,browser,'oddnesse')
+        page.close.assert_not_called()
+        with patch.object(session,'post',side_effect=AssertionError('cached browser page was ignored')):
+            self.assertEqual(app._try_graphql_timeline(session,'oddnesse',None)[0],['https://www.instagram.com/p/A/'])
+
+    def test_profile_api_success_still_observes_chrome_timeline_before_using_static_query(self):
+        session = requests.Session()
+        browser = MagicMock()
+        with patch.object(app,'fetch_profile_info',return_value=({'username':'oddnesse'},[],None,'123')):
+            app.resolve_profile_for_posts(session,browser,'oddnesse')
+        def bootstrap(*args, **kwargs):
+            self.assertTrue(kwargs['force_browser'])
+            session._igdump_timeline_pages = {None:self.timeline_payload()}
+        with patch.object(app,'resolve_profile_for_posts',side_effect=bootstrap) as observe, patch.object(session,'post',side_effect=AssertionError('stale guessed query')):
+            self.assertEqual(app._try_graphql_timeline(session,'oddnesse',None)[0],['https://www.instagram.com/p/A/'])
+        observe.assert_called_once()
+
     def test_missing_pagination_template_is_observed_before_any_guessed_request(self):
         session = requests.Session()
         session._igdump_timeline_page = MagicMock()

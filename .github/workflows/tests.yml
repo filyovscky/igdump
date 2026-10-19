@@ -8,7 +8,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-latest]
+        os: [ubuntu-24.04, windows-latest, macos-latest]
         python: ['3.11', '3.13']
     steps:
       - uses: actions/checkout@v6
@@ -19,3 +19,18 @@ jobs:
       - run: python -m unittest discover -s tests -v
       - run: igdump --help
         working-directory: ${{ runner.temp }}
+      - run: python -c "from importlib.resources import files; assets=files('igdump_assets'); names=['index.html','insights.html','insights.js','interactions.html','leaflet.js','leaflet.css','world-land.json']; assert all(assets.joinpath(name).is_file() for name in names)"
+        working-directory: ${{ runner.temp }}
+
+  browser:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: python -m pip install .
+      - run: python -m playwright install --with-deps chromium
+      - run: python -m unittest discover -s tests -p test_audit_fixes.py -v
+        env:
+          IGDUMP_BROWSER_TESTS: '1'

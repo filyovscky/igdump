@@ -15,6 +15,7 @@ def format_progress(stage: str, current: int, total: int | None = None, detail: 
 import logging
 import sys
 import time
+from getpass import getpass
 from collections import deque
 from rich.console import Console, Group
 from rich.layout import Layout
@@ -71,7 +72,7 @@ class TerminalUI(logging.Handler):
     def render(self):
         rows = max(1, self.console.size.height - 9)
         self.layout["logs"].update(Panel(Group(*list(self.logs)[-rows:]), title="igdump", border_style="dim", padding=(0,1)))
-        self.layout["status"].update(Panel(Group(self.progress, Text(f"HTTP requests: {self.requests}  •  progress is saved", style="dim")),
+        self.layout["status"].update(Panel(Group(self.progress, Text(f"Tracked HTTP requests: {self.requests}  •  progress is saved", style="dim")),
                                          title="Progress", border_style="cyan"))
 
     def update(self, stage, current, total=None, detail=""):
@@ -103,13 +104,13 @@ def record_request():
         _ACTIVE.render()
 
 
-def prompt_input(message):
+def prompt_input(message, secret=False):
     """Pause the redraw while the user types a login confirmation or cookie."""
     live = _ACTIVE.live if _ACTIVE else None
     if live:
         live.stop()
     try:
-        return input(message)
+        return getpass(message) if secret else input(message)
     finally:
         if live:
             live.start()

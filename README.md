@@ -35,7 +35,44 @@ Online `posts` and `full` use an installed Google Chrome. The first login needs
 a graphical session. `--offline` does not launch a browser. Actual runs on
 Linux/macOS have not yet been verified.
 
+In Windows Command Prompt, activate with `.venv\Scripts\activate.bat`.
+To use the tested dependency versions, install with
+`python -m pip install -c requirements-tested.txt -e .` inside the environment.
+Avoid installing into a shared Python used by other OSINT tools.
+
 ## Commands
+
+### Reliability and updates (0.6)
+
+- A completed archive checks the fresh timeline head on its next online run and
+  reconnects it to the saved history. An unfinished scan resumes its saved cursor.
+  Previously archived posts are retained; this is not a live mirror of deletions.
+- Publication order uses full timestamps when available, including pinned posts.
+  Unknown times produce a warning rather than a claim of verified chronology.
+  Latest-N scans can stop early only when dates, pin status and chronological
+  ordinary-post order are known; otherwise the full timeline is traversed.
+- HTTP 200 containing an API failure or missing required list is an error, not
+  a successful empty result. Missing location pictures remain non-fatal.
+- Posts and comment pages are checkpointed in `.posts.sqlite` and `.comments.sqlite`.
+  Existing JSON archives migrate automatically. Post HTML/JSON snapshots update
+  approximately every 10 seconds and at normal completion; SQLite commits each post.
+  Offline reports can recover records newer than the last JSON snapshot.
+- Changing the selection preserves the account archive. A folder lock prevents
+  simultaneous CLI writers, and corrupt JSON caches are reported without erasing them.
+- Full timeline media payloads are reused before opening individual post pages.
+  Missing/expired media falls back to Chrome. Media uses a separate session without
+  Instagram cookies or CSRF headers. Existing public-profile fallbacks are retained.
+- `igdump full "@username" --no-recheck-likes` skips the immediate extra request for
+  an incomplete like list. The default remains one recheck. Coverage stays partial;
+  a fresh reported count can be lower than an older cached count.
+- Cached likes are archived observations collected at different times, not a live
+  snapshot. Use `--refresh` to replace selected lists, including old empty results
+  that may have been created by earlier versions after an API failure.
+- Exit code `4` also applies to incomplete offline archives/interaction lists.
+  Creating an HTML report does not establish that every selected item was collected.
+- `Tracked HTTP requests` excludes requests initiated internally by Chrome.
+  Debug logs include phase elapsed times. Date filters use the export computer's
+  local zone; changing the analytics chart zone does not change the selected posts.
 
 Commands choose what to collect: `posts`, `comments`, `likes`, or `full`.
 Options choose which posts to use. Profiles can be specified as `@username`,

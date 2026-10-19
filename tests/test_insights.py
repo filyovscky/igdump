@@ -188,7 +188,7 @@ class ReportIntegrationTests(unittest.TestCase):
             args = app.parse_args(['full', 'natgeo', '--offline', '--output-dir', directory, '--no-open'])
             self.seed(root, args)
             with patch.object(requests.Session, 'request', side_effect=AssertionError('network')), patch.object(app, 'InstagramBrowser', side_effect=AssertionError('browser')), contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(app.run_full(args), 0)
+                self.assertEqual(app.run_full(args), 4)  # Metadata is present; media archive is incomplete.
             for kind in insights.REPORTS:
                 for extension in ('html', 'csv', 'json'):
                     self.assertTrue((root / f'{kind}.{extension}').exists())
@@ -220,7 +220,7 @@ class ReportIntegrationTests(unittest.TestCase):
             app.save_post_links(root, args, LINKS[:2], 2, True)
             self.assertFalse((root / '.post-dates.json').exists())
             with patch.object(requests.Session, 'request', side_effect=AssertionError('network')):
-                self.assertEqual(app.run(args), 0)
+                self.assertEqual(app.run(args), 4)  # Selected media was not collected in this fixture.
             stats = read_json(root / 'analytics.json')
             self.assertEqual(stats['dated_posts'], 1)
             self.assertEqual(stats['selected_posts'], 1)
@@ -231,8 +231,11 @@ class ReportIntegrationTests(unittest.TestCase):
             root = Path(directory)
             args = app.parse_args(['full', 'natgeo', '--offline', '--limit', '1', '--oldest', '--no-contacts', '--output-dir', directory, '--no-open'])
             self.seed(root, args)
+            (root / 'media').mkdir()
+            for code in 'ABC':
+                (root / 'media' / f'{code}.jpg').write_bytes(b'image')
             app.save_export_state(root, args, {'username': 'natgeo'}, '', [
-                {'shortcode': code, 'caption': f'caption-{code}', 'date_label': 'Date unknown'} for code in 'ABC'], True)
+                {'shortcode': code, 'caption': f'caption-{code}', 'date_label': 'Date unknown', 'local_media_path':f'media/{code}.jpg'} for code in 'ABC'], True)
             (root / 'contacts.html').write_text('stale report', encoding='utf-8')
             with patch.object(requests.Session, 'request', side_effect=AssertionError('network')), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(app.run_full(args), 0)
@@ -251,7 +254,7 @@ class ReportIntegrationTests(unittest.TestCase):
             store.mark('A', 'partial', expected=2, error='=untrusted()')
             store.close()
             with patch.object(requests.Session, 'request', side_effect=AssertionError('network')), contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(app.run_comments(args), 0)
+                self.assertEqual(app.run_comments(args), 4)  # Offline report must retain incomplete coverage.
             with (root / 'likes-coverage.csv').open(encoding='utf-8-sig', newline='') as handle:
                 self.assertEqual(next(csv.DictReader(handle))['reason'], "'=untrusted()")
 
