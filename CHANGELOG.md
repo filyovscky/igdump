@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.0 — 2026-10-26
+
+- Add feed/photo-grid switching, exact-date sorting, hover/focus dates, flat
+  carousel media order, keyboard/lightbox navigation and scrollbar-free carousels.
+- Capture authenticated profile-card responses that have numeric ID variables,
+  persist profile snapshots and distinguish empty from unavailable biographies.
+- Generate editable/copyable Russian profile summaries and TXT exports from saved
+  profile, comment, liker, mention/tag and location data, with explicit coverage.
+- Add Highlights-only collection and full/post flags, album limits, image/video
+  exports, cache resumption and offline reports with partial-state reporting.
+- Include gallery/report/highlight browser regressions and package new assets.
+
 ## 0.6.0 — 2026-10-19
 
 - Capture both `/api/graphql` and `/graphql/query` browser timeline responses,

@@ -229,7 +229,7 @@ class ReportIntegrationTests(unittest.TestCase):
     def test_full_offline_keeps_limited_archive_order_and_disabled_report_links(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            args = app.parse_args(['full', 'natgeo', '--offline', '--limit', '1', '--oldest', '--no-contacts', '--output-dir', directory, '--no-open'])
+            args = app.parse_args(['full', 'natgeo', '--offline', '--limit', '1', '--oldest', '--no-contacts', '--no-highlights', '--output-dir', directory, '--no-open'])
             self.seed(root, args)
             (root / 'media').mkdir()
             for code in 'ABC':

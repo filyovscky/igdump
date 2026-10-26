@@ -182,7 +182,7 @@ class ResumeTests(unittest.TestCase):
 
     def test_full_runs_all_phases_and_opens_only_summary(self):
         with tempfile.TemporaryDirectory() as directory:
-            args = app.parse_args(["full", "natgeo", "--limit", "100", "--output-dir", directory])
+            args = app.parse_args(["full", "natgeo", "--limit", "100", "--no-highlights", "--output-dir", directory])
             modes = []
             def phase(arg):
                 modes.append((arg.mode, arg.limit, arg.no_open, arg.output_dir))
@@ -196,7 +196,7 @@ class ResumeTests(unittest.TestCase):
     def test_full_reuses_selected_links_and_session_without_profile_requests(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            args = app.parse_args(["full", "natgeo", "--limit", "1", "--output-dir", directory, "--no-open"])
+            args = app.parse_args(["full", "natgeo", "--limit", "1", "--no-highlights", "--output-dir", directory, "--no-open"])
             def posts(phase):
                 phase._shared_session = requests.Session()
                 phase._selected_links = ["https://www.instagram.com/p/A/"]

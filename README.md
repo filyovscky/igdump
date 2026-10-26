@@ -31,7 +31,7 @@ python -m pip install -e .
 igdump -h
 ```
 
-Online `posts` and `full` use an installed Google Chrome. The first login needs
+Online `posts`, `full` and `highlights` use an installed Google Chrome. The first login needs
 a graphical session. `--offline` does not launch a browser. Actual runs on
 Linux/macOS have not yet been verified.
 
@@ -41,6 +41,47 @@ To use the tested dependency versions, install with
 Avoid installing into a shared Python used by other OSINT tools.
 
 ## Commands
+
+### Gallery, text report and Highlights (0.7)
+
+The post archive switches between **Feed** and **Photo grid**. The grid displays
+every saved carousel image separately, keeping slide order within each post.
+Hover/focus reveals the publication date; clicking opens a viewer with previous/next
+media navigation. **Post order** switches between newest and oldest first without
+changing the saved collection. View/order preferences are remembered locally.
+Carousels use arrows, swipe and a frame counter instead of horizontal scrollbars.
+
+`full` includes `summary.html` and `summary.txt`: an editable, copyable Russian report
+with profile counts, up to ten leading commenters/likers, all received account
+mentions/tags and received place names. Rankings use the selected post sample;
+missing fields and incomplete lists are explicitly marked. Profile counts and bio
+are read from the authenticated profile query as well as HTML/API fallbacks. An empty
+bio and an unavailable bio are different states.
+
+Highlights are enabled in online `full`; other post exports can enable `--highlights`.
+They use additional authenticated page requests, unlike passive analytics. Cached
+completed albums resume locally; `--refresh` rechecks selected albums. Public/profile
+access restrictions still apply. The page stores only items actually returned by
+Instagram and reports partial/failed albums. It does not click the story-view button
+or send a separate mark-seen request; Instagram may still record access to its pages.
+
+```console
+igdump highlights "@username"
+igdump highlights "@username" --highlight-limit 1 --download-videos
+igdump full "@username" --no-highlights --no-text-report
+igdump full "@username" --highlight-limit 3
+igdump full "@username" --offline --output-dir "exports/username-full-0"
+```
+
+Post `--limit`, date filters and gallery sort do not limit Highlights. Use
+`--highlight-limit N` for albums (0 = all received albums). By default, photos and
+video covers are saved; **`--download-videos` also applies to Highlights**.
+Highlights are in `highlights.html`, `highlights.csv`, `.highlights.json` and
+`highlights/`. Offline mode rebuilds saved albums without Instagram requests.
+An old archive without Highlights data is reported as not collected; a one-album
+cache is not represented as the whole profile. Use `--no-highlights` to rebuild only
+existing post/interaction reports. `--text-report` is also available on `posts`,
+`comments` and `likes`; it makes no additional network requests.
 
 ### Reliability and updates (0.6)
 

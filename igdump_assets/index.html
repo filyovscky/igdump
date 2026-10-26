@@ -487,6 +487,7 @@
       }}
     }}
   </style>
+  <link rel="stylesheet" href="archive.css">
 </head>
 <body>
   <header class="topbar">
@@ -516,12 +517,13 @@
           <div><strong>{post_count}</strong> posts</div>
           <div><strong>{followers}</strong> followers</div>
           <div><strong>{followees}</strong> following</div>
-          <div><strong>{mode_label}</strong></div>
+          <div><strong id="archive-selection-label">{mode_label}</strong></div>
         </div>
         <div class="bio">{bio}</div>
       </div>
     </section>
 
+    <div class="archive-controls"><div class="view-switch" role="group" aria-label="Archive view"><button type="button" data-archive-view="feed" aria-pressed="true">Feed</button><button type="button" data-archive-view="grid" aria-pressed="false">Photo grid</button></div><label for="archive-order">Post order <select id="archive-order"><option value="newest">Newest first</option><option value="oldest">Oldest first</option></select></label></div>
     <section class="feed-shell">
       <div class="feed-column">
         <div class="render-progress" id="render-progress"></div>
@@ -533,155 +535,16 @@
     </section>
   </main>
 
-  <div id="lightbox" class="lightbox" role="dialog" aria-label="Image viewer">
+  <div id="lightbox" class="lightbox" role="dialog" aria-label="Image viewer" hidden>
     <button class="lightbox-close" id="lightbox-close" aria-label="Close">&times;</button>
+    <button type="button" class="lightbox-nav" id="lightbox-prev" aria-label="Previous media">‹</button>
     <img id="lightbox-img" src="" alt="">
+    <video id="lightbox-video" hidden controls playsinline></video>
+    <button type="button" class="lightbox-nav" id="lightbox-next" aria-label="Next media">›</button>
+    <div id="lightbox-caption" class="lightbox-caption" aria-live="polite"></div>
   </div>
 
   <script id="post-data" type="application/json">{post_data}</script>
-  <script>
-    const payload = JSON.parse(document.getElementById("post-data").textContent);
-    const posts = payload.posts || [];
-    const feed = document.getElementById("feed");
-    const empty = document.getElementById("empty");
-    const sentinel = document.getElementById("sentinel");
-    const loader = document.getElementById("loader");
-    const progress = document.getElementById("render-progress");
-    const batchSize = Math.max(1, payload.batch_size || 9);
-    let cursor = 0;
-
-    const escapeHtml = (value) => value
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;")
-      .replaceAll('"', "&quot;");
-
-    const formatCaption = (caption) => {{
-      if (!caption) {{
-        return '<div class="caption caption-empty">No caption</div>';
-      }}
-      return `<div class="caption">${{escapeHtml(caption)}}</div>`;
-    }};
-
-    const renderProgress = () => {{
-      if (!posts.length) {{
-        progress.textContent = "";
-        return;
-      }}
-      progress.textContent = `Showing ${{Math.min(cursor, posts.length)}} of ${{posts.length}} posts`;
-    }};
-
-
-    const renderMedia = (post) => {{
-      const paths = post.media_paths || [post.local_media_path];
-      const renderItem = (p, i) => post.media_types?.[i] === "video"
-        ? `<video class="post-media" src="${{escapeHtml(p)}}" controls preload="metadata" playsinline></video>`
-        : `<div class="media-wrap" data-src="${{escapeHtml(p)}}"><img class="post-media" src="${{escapeHtml(p)}}" alt="${{escapeHtml(post.alt_text)}}" loading="lazy"></div>`;
-      if (paths.length === 1) {{
-        return renderItem(paths[0], 0);
-      }}
-      const imgs = paths.map(renderItem).join("");
-      const dots = paths.map((_, i) =>
-        `<span class="carousel-dot${{i === 0 ? " active" : ""}}"></span>`
-      ).join("");
-      return `<div class="carousel">${{imgs}}</div><div class="carousel-dots">${{dots}}</div>`;
-    }};
-
-    const lightbox = document.getElementById("lightbox");
-    const lightboxImg = document.getElementById("lightbox-img");
-    const lightboxClose = document.getElementById("lightbox-close");
-
-    const openLightbox = (src) => {{
-      lightboxImg.src = src;
-      lightbox.classList.add("open");
-    }};
-
-    const closeLightbox = () => {{
-      lightbox.classList.remove("open");
-      lightboxImg.src = "";
-    }};
-
-    lightboxClose.addEventListener("click", closeLightbox);
-    lightbox.addEventListener("click", (e) => {{
-      if (e.target === lightbox) closeLightbox();
-    }});
-    document.addEventListener("keydown", (e) => {{
-      if (e.key === "Escape") closeLightbox();
-    }});
-
-    const createCard = (post, index) => {{
-      const card = document.createElement("article");
-      card.className = "post-card";
-      card.style.animationDelay = `${{Math.min(index * 35, 220)}}ms`;
-      card.innerHTML = `
-        <div class="post-head">
-          <img class="avatar" src="${{escapeHtml(payload.profile.avatar_src)}}" alt="">
-          <div class="post-owner">
-            <strong>@${{escapeHtml(payload.profile.username)}}</strong>
-            <span>${{escapeHtml(post.date_label)}}</span>
-          </div>
-          <a class="post-link" href="${{escapeHtml(post.instagram_url)}}" target="_blank" rel="noreferrer">Instagram</a>
-        </div>
-        ${{renderMedia(post)}}
-        <div class="post-body">
-          <div class="post-stats">
-            <span>${{escapeHtml(post.likes_label)}}</span>
-            <span>${{escapeHtml(post.comments_label)}}</span>
-            <span>${{escapeHtml(post.kind_label)}}</span>
-          </div>
-          ${{formatCaption(post.caption)}}
-        </div>
-      `;
-
-      // Carousel scroll -> active dot
-      const carousel = card.querySelector(".carousel");
-      const dots = card.querySelectorAll(".carousel-dot");
-      if (carousel && dots.length > 1) {{
-        carousel.addEventListener("scroll", () => {{
-          const idx = Math.round(carousel.scrollLeft / carousel.clientWidth);
-          dots.forEach((d, i) => d.classList.toggle("active", i === idx));
-        }});
-      }}
-
-      // Lightbox on image click
-      card.querySelectorAll(".media-wrap").forEach((wrap) => {{
-        wrap.addEventListener("click", () => {{
-          const src = wrap.getAttribute("data-src");
-          if (src) openLightbox(src);
-        }});
-      }});
-
-      return card;
-    }};
-
-    const renderNextBatch = () => {{
-      if (!posts.length) {{
-        empty.hidden = false;
-        loader.classList.add("hidden");
-        return;
-      }}
-
-      const chunk = posts.slice(cursor, cursor + batchSize);
-      chunk.forEach((post, idx) => feed.appendChild(createCard(post, idx)));
-      cursor += chunk.length;
-      renderProgress();
-
-      if (cursor >= posts.length) {{
-        loader.classList.add("hidden");
-        observer.disconnect();
-      }}
-    }};
-
-    const observer = new IntersectionObserver((entries) => {{
-      for (const entry of entries) {{
-        if (entry.isIntersecting) {{
-          renderNextBatch();
-        }}
-      }}
-    }}, {{ rootMargin: "220px 0px" }});
-
-    renderNextBatch();
-    observer.observe(sentinel);
-  </script>
+  <script src="archive.js" defer></script>
 </body>
 </html>

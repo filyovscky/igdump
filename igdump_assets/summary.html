@@ -1,0 +1,7 @@
+<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>$title</title><style>
+body{margin:0;background:#fafafa;color:#202020;font:16px system-ui,sans-serif}main{max-width:1040px;margin:32px auto;padding:0 24px 48px}h1{font-size:25px}nav,.actions{display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin:20px 0}a{color:#bd3163}button{font:inherit;padding:8px 14px;border:1px solid #bbb;background:white;cursor:pointer;border-radius:4px}textarea{box-sizing:border-box;width:100%;min-height:65vh;padding:16px;border:1px solid #bbb;border-radius:4px;font:16px/1.65 system-ui;resize:vertical;background:white;color:#202020}button:focus-visible,textarea:focus-visible{outline:2px solid #bd3163;outline-offset:2px}#copy-status{color:#555}
+</style><main><h1>$title</h1><nav>$navigation</nav>
+<p>Текст можно отредактировать перед копированием. Неизвестные поля и неполнота сбора отмечены явно.</p>
+<div class="actions"><button type="button" id="copy-report">Скопировать отчёт</button><span id="copy-status" role="status"></span></div>
+<textarea id="text-report" aria-label="Текстовый отчёт">$report</textarea></main><script src="summary.js" defer></script></html>

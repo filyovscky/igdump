@@ -103,6 +103,8 @@ from igdump_dates import parse_date, post_date, date_matches, date_label
 from igdump_progress import update_progress, TerminalUI, record_request, prompt_input
 from igdump_csv import write_csv
 from igdump_insights import REPORTS, publication_details, remember_details, save_details, cached_details, generate_reports
+from igdump_summary import generate_summary
+from igdump_highlights import export_highlights, rebuild_highlights
 from playwright.sync_api import BrowserContext, Error as PlaywrightError, Page, Playwright, TimeoutError, sync_playwright
 
 logger = logging.getLogger("igdump")
@@ -136,7 +138,7 @@ HTML_TEMPLATE = (TEMPLATE_DIR / "index.html").read_text(encoding="utf-8")
 try:
     VERSION = _pkg_version("igdump")
 except PackageNotFoundError:
-    VERSION = "0.6.0"
+    VERSION = "0.7.0"
 
 
 class ExportError(RuntimeError):
@@ -370,7 +372,7 @@ def nonnegative_delay(value: str) -> float:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Export Instagram posts, comments, likes or everything together.",
+        description="Export Instagram posts, comments, likes, Highlights or everything together.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   igdump posts @kharlamova_alena
@@ -387,11 +389,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
       Posts with publication charts, mentioned/tagged accounts, contacts and locations.
   igdump full "@kharlamova_alena" --offline --output-dir "exports/kharlamova_alena-full-0"
       Rebuild all reports from the original export folder without network requests.
+  igdump highlights "@kharlamova_alena" --download-videos
+      Save available Highlights albums, including video files.
 
 Commands choose what to collect. Options choose which posts to use.
 No --limit (or --limit 0) means all posts. --oldest selects earliest posts.
 Dates include both boundary days and apply before --limit.
 full enables --analytics, --mentions, --contacts and --locations by default.
+full also enables --text-report and --highlights; --no-highlights disables the
+additional authenticated Highlight requests. --highlight-limit limits albums.
 Other commands enable these reports with flags; --no-analytics, --no-mentions,
 --no-contacts and --no-locations disable individual reports in full.
 Passive reports use received or cached data and add no Instagram requests.
@@ -406,7 +412,9 @@ Legacy post commands: all = posts; oldest = posts --oldest --limit N.
     parser.add_argument("--version", action="version", version=f"igdump {VERSION}")
     parser.set_defaults(batch_size=9, headful=False, download_videos=False,
                         sessionid=None, comment_delay=2.0, like_delay=2.0,
-                        offline=False, retry_missing=False)
+                        offline=False, retry_missing=False, after=None, before=None, oldest=False, limit=0,
+                        dry_run=False, refresh=False, text_report=None, highlights=None, highlight_limit=0,
+                        **{flag:False for flag in REPORTS})
     subparsers = parser.add_subparsers(dest="mode", required=True)
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("username", type=instagram_username, metavar="USERNAME", help="Instagram username, with or without @, or a profile URL (https://www.instagram.com/username/).")
@@ -424,6 +432,7 @@ Legacy post commands: all = posts; oldest = posts --oldest --limit N.
     for flag, title in REPORTS.items():
         common.add_argument(f"--{flag}", action=argparse.BooleanOptionalAction, default=None,
                             help=f"{title} from received/cached posts only, with no extra requests (default: enabled in full).")
+    common.add_argument('--text-report', action=argparse.BooleanOptionalAction, default=None, help='Copyable Russian summary from saved profile/posts/comments/likes (default: enabled in full).')
     verbosity = common.add_mutually_exclusive_group()
     verbosity.add_argument("--verbose", action="store_true", help="Show detailed debug logs.")
     verbosity.add_argument("--quiet", action="store_true", help="Show only warnings and errors.")
@@ -442,6 +451,8 @@ Legacy post commands: all = posts; oldest = posts --oldest --limit N.
         help="Export posts, comments, likes and passive publication reports.",
         description="Posts, comments, likes and passive publication reports for the same selected posts. Online phases share the Chrome session. full.html links to all enabled reports and opens after collection.")
     for command in (posts, full):
+        command.add_argument('--highlights', action=argparse.BooleanOptionalAction, default=None, help='Export available Highlights albums with additional authenticated page requests (default: enabled in full).')
+        command.add_argument('--highlight-limit', type=nonnegative_int, default=0, metavar='N', help='Maximum Highlights albums, independent of post/date selection (0 = all).')
         command.add_argument("--download-videos", action="store_true", help="Download videos; by default, save only photos and video covers.")
         command.add_argument("--batch-size", type=positive_int, default=9, metavar="N", help="Cards loaded per scroll batch in the post archive (default: 9). Does not change request batching.")
         command.add_argument("--headful", action="store_true", help="Keep Chrome visible throughout post collection.")
@@ -453,6 +464,13 @@ Legacy post commands: all = posts; oldest = posts --oldest --limit N.
         command.add_argument("--like-delay", type=nonnegative_delay, default=2.0, metavar="SECONDS", help="Delay between like-list requests, including automatic rechecks (default: 2 seconds).")
         command.add_argument('--recheck-likes', action=argparse.BooleanOptionalAction, default=True, help='Immediately recheck a newly incomplete like list once (default: enabled). --no-recheck-likes avoids the extra request; coverage remains partial.')
         command.add_argument("--retry-missing", action="store_true", help=argparse.SUPPRESS)
+    highlights_command = subparsers.add_parser('highlights', help='Export Highlights albums only.', description='Save available Highlights albums as local media and highlights.html. Video covers by default; --download-videos saves videos. Cached complete albums are reused unless --refresh is set.')
+    highlights_command.add_argument('username', type=instagram_username)
+    highlights_command.add_argument('--output-dir', default=None)
+    highlights_command.add_argument('--browser-profile-dir', default=str(DEFAULT_PROFILE_DIR))
+    highlights_command.add_argument('--highlight-limit', type=nonnegative_int, default=0, metavar='N', help='Maximum albums (0 = all).')
+    for option, help_text in [('offline','Rebuild from saved Highlights without HTTP requests.'),('refresh','Recheck available albums and replace selected cached metadata.'),('no-open','Do not open the finished report.'),('headful','Keep Chrome visible.'),('download-videos','Save videos instead of only their covers.'),('quiet','Show only warnings and errors.'),('verbose','Show debug logs.')]:
+        highlights_command.add_argument('--'+option, action='store_true', help=help_text)
 
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments[:2] == ["all", "oldest"]:
@@ -465,6 +483,9 @@ Legacy post commands: all = posts; oldest = posts --oldest --limit N.
     elif legacy == "likers":
         arguments[0] = "likes"
     parsed = parser.parse_args(arguments)
+    for flag in ('text_report','highlights'):
+        if getattr(parsed,flag) is None:
+            setattr(parsed,flag,parsed.mode in ('full','highlights') if flag=='highlights' else parsed.mode=='full')
     for flag in REPORTS:
         if getattr(parsed, flag) is None:
             setattr(parsed, flag, parsed.mode == "full")
@@ -484,6 +505,8 @@ def safe_slug(value: str) -> str:
 
 
 def build_job_slug(args: argparse.Namespace) -> str:
+    if args.mode=='highlights':
+        return f'{safe_slug(args.username)}-highlights-{args.highlight_limit}'
     if args.mode == "all":
         slug = f"{safe_slug(args.username)}-all"
     else:
@@ -839,7 +862,7 @@ def _scrape_profile_html(username: str, session=None) -> tuple[dict[str, Any], l
             profile = {
                 "username": user_obj.get("username") or username,
                 "full_name": user_obj.get("full_name") or username,
-                "biography": user_obj.get("biography") or "",
+                "biography": user_obj.get("biography"),
                 "mediacount": (user_obj.get("edge_owner_to_timeline_media") or {}).get("count"),
                 "followers": (user_obj.get("edge_followed_by") or {}).get("count"),
                 "followees": (user_obj.get("edge_follow") or {}).get("count"),
@@ -868,14 +891,14 @@ def _scrape_profile_html(username: str, session=None) -> tuple[dict[str, Any], l
     title_m = re.search(r'<title>([^<]+)', text)
     raw = title_m.group(1) if title_m else username
     display_name = raw.split("(")[0].strip() if "(" in raw else raw
-    scraped_username = (re.search(r"@(\w+)", raw).group(1) if re.search(r"@(\w+)", raw) else username)
+    scraped_username = username
 
     uid = _extract_user_id_from_html(text, username)
 
     profile = {
         "username": scraped_username,
         "full_name": display_name,
-        "biography": "",
+        "biography": None,
         "mediacount": None,
         "followers": None,
         "followees": None,
@@ -896,7 +919,7 @@ def profile_metadata_from_user(user, username):
         return {}
     result = {}
     for key in ("full_name", "biography"):
-        if isinstance(user.get(key), str) and user[key]:
+        if isinstance(user.get(key), str):
             result[key] = user[key]
     avatar = user.get("hd_profile_pic_url_info")
     avatar = avatar.get("url") if isinstance(avatar, dict) else None
@@ -909,9 +932,50 @@ def profile_metadata_from_user(user, username):
         value = user.get(direct)
         if value is None and isinstance(user.get(nested), dict):
             value = user[nested].get("count")
+        if isinstance(value, str) and value.isdecimal():
+            value = int(value)
         if isinstance(value, int) and not isinstance(value, bool):
             result[dest] = value
     return result
+
+
+def capture_browser_profile(session, username, response):
+    endpoint = urlparse(response.url)
+    if endpoint.hostname not in ('www.instagram.com','instagram.com') or endpoint.path.rstrip('/') not in ('/api/graphql','/graphql/query') or response.status != 200:
+        return
+    try:
+        payload = response.json()
+        data = payload.get('data') or {}
+        user = data.get('user')
+        metadata = profile_metadata_from_user(user, username)
+        if metadata:
+            saved = getattr(session, '_igdump_browser_profile_metadata', {})
+            if not isinstance(saved, dict): saved = {}
+            saved.update(metadata)
+            if all(key in metadata for key in ('followers','followees','mediacount')):
+                saved['observed_at'] = datetime.now(UTC).isoformat()
+            saved['user_id'] = str(user.get('pk') or user.get('id') or '')
+            session._igdump_browser_profile_metadata = saved
+        tray = data.get('highlights')
+        if not payload.get('errors') and isinstance(tray, dict) and isinstance(tray.get('edges'), list):
+            nodes = [edge['node'] for edge in tray['edges'] if isinstance(edge.get('node'), dict)]
+            headers = response.request.all_headers()
+            referer = urlparse(headers.get('referer','')).path.strip('/').casefold()
+            form={key:values[-1] for key,values in parse_qs(response.request.post_data or '').items()}
+            variables=json.loads(form.get('variables','{}'))
+            owner=str(variables.get('user_id') or '')
+            metadata=getattr(session,'_igdump_browser_profile_metadata',{})
+            target_uid=metadata.get('user_id') if isinstance(metadata,dict) else None
+            if not nodes and owner.isdecimal():
+                pending=getattr(session,'_igdump_empty_highlight_trays',{})
+                if not isinstance(pending,dict):pending={}
+                pending[owner]=tray.get('page_info') or {}
+                session._igdump_empty_highlight_trays=pending
+            if (nodes and all(str((node.get('user') or {}).get('username','')).casefold() == username.casefold() for node in nodes)) or (not nodes and (referer == username.casefold() or owner and owner==target_uid)):
+                session._igdump_highlight_nodes = nodes
+                session._igdump_highlight_page_info = tray.get('page_info') or {}
+    except (ValueError,TypeError,AttributeError,PlaywrightError):
+        return
 
 
 def profile_metadata_from_html(text, username):
@@ -1124,12 +1188,14 @@ def fetch_profile_info(session: requests.Session, username: str) -> tuple[dict[s
     profile = {
         "username": user.get("username") or username,
         "full_name": user.get("full_name") or "Unnamed profile",
-        "biography": user.get("biography") or "No biography provided.",
-        "mediacount": media.get("count") or 0,
-        "followers": user.get("edge_followed_by", {}).get("count") or 0,
-        "followees": user.get("edge_follow", {}).get("count") or 0,
+        "biography": user.get("biography"),
+        "mediacount": media.get("count"),
+        "followers": (user.get("edge_followed_by") or {}).get("count"),
+        "followees": (user.get("edge_follow") or {}).get("count"),
         "avatar_url": user.get("profile_pic_url_hd") or user.get("profile_pic_url"),
     }
+    profile.update(profile_metadata_from_user(user, username))
+    profile['observed_at'] = datetime.now(UTC).isoformat()
     end_cursor = media.get("page_info", {}).get("end_cursor")
     user_id = str(user.get("id") or user.get("pk") or "")
     return profile, initial_links, end_cursor, user_id
@@ -1179,6 +1245,7 @@ def observe_browser_pagination(session, username, after_cursor):
     if page is None:
         return None
     def capture(response):
+        capture_browser_profile(session, username, response)
         capture_browser_timeline(session, username, response)
     page.context.on("response", capture)
     try:
@@ -1216,6 +1283,7 @@ def resolve_profile_for_posts(session, browser, username, force_browser=False):
     logger.warning("Profile ID unavailable in public HTML. Reading the logged-in Chrome profile page ...")
     context = browser.require_context()
     def capture(response):
+        capture_browser_profile(session, username, response)
         capture_browser_timeline(session, username, response)
     context.on("response", capture)
     page = browser.open_page(f"{IG_BASE_URL}/{username}/")
@@ -1233,12 +1301,21 @@ def resolve_profile_for_posts(session, browser, username, force_browser=False):
             if attempt == 0:
                 page.mouse.wheel(0, 700)
             page.wait_for_timeout(500)
+        for _ in range(6):
+            metadata = getattr(session, '_igdump_browser_profile_metadata', {})
+            if isinstance(metadata, dict) and all(key in metadata for key in ('followers','followees','mediacount','biography')):
+                break
+            page.wait_for_timeout(500)
         html = page.content()
         uid = _extract_user_id_from_html(html, username)
         if not uid:
             uid = _resolve_user_id_via_search(username, session=session)
         if not uid:
             raise ExportError(f"Could not identify @{username}: public HTML and the logged-in Chrome page supplied no profile ID.")
+        empty_trays=getattr(session,'_igdump_empty_highlight_trays',{})
+        if isinstance(empty_trays,dict) and uid in empty_trays:
+            session._igdump_highlight_nodes=[]
+            session._igdump_highlight_page_info=empty_trays[uid]
         metadata = getattr(session, "_igdump_browser_profile_metadata", {})
         profile.update(metadata)
         profile.update(profile_metadata_from_html(html, username))
@@ -1831,6 +1908,9 @@ def generate_html(
     batch_size: int,
     report_names: list[str] | None = None,
 ) -> None:
+    saved_profile=read_json(output_dir/'.profile.json') or {}
+    if saved_profile.get('username')==profile.get('username'):
+        profile={**profile,**saved_profile.get('profile',{})}
     post_records = [
         {**record, "date_label": "Date unknown"}
         if record.get("date_label") == "\u0414\u0430\u0442\u0430 \u043d\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043d\u0430"
@@ -1844,6 +1924,8 @@ def generate_html(
         },
         "posts": post_records,
         "batch_size": batch_size,
+        "initial_order": 'oldest' if 'oldest first' in mode_label else 'newest',
+        "selection_label": mode_label,
     }
 
     raw_json = json.dumps(payload, ensure_ascii=False).replace('<', '\\u003c').replace('>', '\\u003e').replace('&', '\\u0026')
@@ -1859,16 +1941,78 @@ def generate_html(
         followers=escape(format_count(profile.get("followers"))),
         followees=escape(format_count(profile.get("followees"))),
         mode_label=escape(mode_label),
-        bio=escape(profile.get("biography") or "No biography provided."),
+        bio=escape(profile['biography'] or 'Biography is empty.' if isinstance(profile.get('biography'),str) else 'Biography was not received.'),
         post_data=raw_json,
     )
-    report_links = "".join(f'<a href="{kind}.html">{escape(title)}</a> ' for kind, title in REPORTS.items()
+    report_links = "".join(f'<a href="{kind}.html">{escape(title)}</a> ' for kind, title in {**REPORTS, 'summary':'Text report', 'highlights':'Highlights'}.items()
                            if (report_names is None or kind in report_names) and (output_dir / f"{kind}.html").exists())
     if report_links:
         html = html.replace('<main class="page">', '<main class="page"><nav aria-label="Publication reports" style="padding:16px 0;display:flex;gap:20px;flex-wrap:wrap">' + report_links + '</nav>')
     index_file = output_dir / "index.html"
+    for asset in ('archive.js','archive.css'):
+        atomic_write(output_dir / asset, (TEMPLATE_DIR / asset).read_bytes())
     atomic_write(index_file, html)
     logger.debug("HTML saved to %s", index_file)
+
+
+def save_profile_metadata(output_dir, username, profile, session=None):
+    cached = read_json(output_dir / '.profile.json') or {}
+    previous = cached.get('profile', {}) if cached.get('username') == username else {}
+    if not previous:
+        state = read_json(export_state_path(output_dir)) or {}
+        if (state.get('job') or {}).get('username') == username:
+            previous = state.get('profile') or {}
+    merged = {**{key:value for key,value in previous.items() if value is not None and value not in ('No biography provided.','Unnamed profile')}, 'username': username}
+    merged.update({key:value for key,value in profile.items() if value is not None and value not in ('No biography provided.','Unnamed profile')})
+    observed = getattr(session, '_igdump_browser_profile_metadata', None) if session is not None else None
+    if isinstance(observed, dict):
+        merged.update({key:value for key,value in observed.items() if value is not None})
+    write_json(output_dir / '.profile.json', {'username':username,'profile':merged})
+    return merged
+
+
+def enabled_report_names(args):
+    return [name for name in REPORTS if getattr(args,name,False)] + (['summary'] if getattr(args,'text_report',False) else []) + (['highlights'] if getattr(args,'highlights',False) else [])
+
+
+def collect_profile_highlights(args, browser, session, output_dir):
+    try:
+        nodes=getattr(session,'_igdump_highlight_nodes',None)
+        if not isinstance(nodes,list):
+            profile,_,_,_=resolve_profile_for_posts(session,browser,args.username,force_browser=True)
+            save_profile_metadata(output_dir,args.username,profile,session)
+            nodes=getattr(session,'_igdump_highlight_nodes',None)
+        if not isinstance(nodes,list):raise ExportError('Instagram did not return the Highlights album list. Saved data is preserved.')
+        info=getattr(session,'_igdump_highlight_page_info',{})
+        result=export_highlights(output_dir,args.username,nodes,browser,
+            lambda url,path:download_binary(session,url,path),videos=args.download_videos,
+            refresh=args.refresh,limit=args.highlight_limit,tray_complete=isinstance(info,dict) and info.get('has_next_page') is False)
+    except Exception as exc:
+        logger.error('Highlights: %s',exc)
+        if is_rate_limited(exc) or 'denied access' in str(exc):args._rate_limited=True
+        cache=read_json(output_dir/'.highlights.json') or {}
+        if cache.get('username')!=args.username:cache={'username':args.username,'albums':[]}
+        cache['completed']=False;cache['reason']=str(exc)
+        write_json(output_dir/'.highlights.json',cache)
+        rebuild_highlights(output_dir,args.username,getattr(args,"highlight_limit",0))
+        result=4
+    args._highlights_result=result
+    return result
+
+
+def run_highlights(args):
+    root=ensure_output_dir(args.output_dir,args)
+    if args.offline:result=rebuild_highlights(root,args.username,args.highlight_limit)
+    else:
+        with InstagramBrowser(Path(args.browser_profile_dir).expanduser().resolve(),args.headful) as browser:
+            browser.ensure_logged_in()
+            session=browser.authenticated_session();_patch_session_for_logging(session)
+            profile,_,_,_=resolve_profile_for_posts(session,browser,args.username)
+            save_profile_metadata(root,args.username,profile,session)
+            result=collect_profile_highlights(args,browser,session,root)
+    _save_debug_log(root)
+    print((root/'highlights.html').as_uri());open_export(root/'highlights.html',args)
+    return result
 
 
 def remember_post_dates(session: requests.Session, items: list[dict[str, Any]]) -> None:
@@ -2039,6 +2183,7 @@ def run(args: argparse.Namespace) -> int:
             profile, _, _, user_id = resolve_profile_for_posts(session, browser, args.username)
         finally:
             del session._igdump_profile_transport
+        profile = save_profile_metadata(output_dir, args.username, profile, session)
         logger.info("Resolved @%s profile metadata", profile["username"])
 
         # Try to resume from saved cursor; if missing, fetch first page fresh.
@@ -2065,6 +2210,7 @@ def run(args: argparse.Namespace) -> int:
             user_id=user_id,
         )
         logger.info("Collected %s post URLs", len(all_links))
+        profile = save_profile_metadata(output_dir, args.username, profile, session)
         timeline_state = read_json(post_links_path(output_dir))
         timeline_complete = timeline_state is None or timeline_satisfies_selection(output_dir, args)
         if not timeline_complete:
@@ -2143,7 +2289,7 @@ def run(args: argparse.Namespace) -> int:
                     save_export_state(output_dir, args, profile, avatar_name, ordered, completed=completed)
                     generate_html(profile=profile, post_records=ordered, avatar_src=avatar_name,
                                   mode_label=build_mode_label(args), output_dir=output_dir, batch_size=max(1, args.batch_size),
-                                  report_names=[kind for kind in REPORTS if getattr(args, kind, False)])
+                                  report_names=enabled_report_names(args))
                     last_render[0] = now
 
             last_render = [float('-inf')]
@@ -2185,6 +2331,9 @@ def run(args: argparse.Namespace) -> int:
                 update_progress("Posts", len(post_records) + len(errors), len(selected_links))
 
             completed = len(post_records) == len(selected_links) and not errors and timeline_complete
+            if getattr(args,'highlights',False) and not getattr(args,'_rate_limited',False):
+                collect_profile_highlights(args,browser,session,output_dir)
+                profile=save_profile_metadata(output_dir,args.username,profile,session)
             passive_reports(args, output_dir, session, selected_links)
             last_render[0] = float('-inf')  # Always render the final partial or complete result.
             checkpoint(completed)
@@ -2195,14 +2344,14 @@ def run(args: argparse.Namespace) -> int:
             _save_debug_log(output_dir)
             print((output_dir / "index.html").as_uri())
             open_export(output_dir / "index.html", args)
-            return 0 if completed else 4
+            return 0 if completed and (args.mode=='full' or not getattr(args,'_highlights_result',0)) else 4
 
 
 def passive_reports(args, output_dir, session=None, links=None):
     if args.dry_run or getattr(args, "_skip_insights", False):
         return []
     enabled = [kind for kind in REPORTS if getattr(args, kind, False)]
-    if not enabled:
+    if not enabled and not getattr(args,'text_report',False) and not getattr(args,'highlights',False):
         return []
     if session is not None:
         save_details(session, output_dir, args.username)
@@ -2216,6 +2365,11 @@ def passive_reports(args, output_dir, session=None, links=None):
         offline_args.offline, offline_args.refresh = True, False
         links = select_post_links(filter_links_by_date(cached["links"], offline_args, requests.Session(), output_dir), args)
     reports = generate_reports(output_dir, args.username, links, enabled, build_mode_label(args), full=args.mode == "full")
+    if getattr(args,'text_report',False):
+        reports.append(generate_summary(output_dir,args.username,links))
+    if getattr(args,'highlights',False):
+        result=rebuild_highlights(output_dir,args.username,getattr(args,"highlight_limit",0)) if args.offline or not hasattr(args,'_highlights_result') else args._highlights_result
+        reports.append(('Highlights','highlights.html',result))
     for title, filename, _ in reports:
         logger.info("Saved passive report: %s", output_dir / filename)
     return reports
@@ -2232,6 +2386,8 @@ def run_posts_offline(args, output_dir):
     state = read_json(export_state_path(output_dir)) or {}
     if (state.get("job") or {}).get("username") != args.username:
         state = {}
+    if state:
+        state['profile'] = save_profile_metadata(output_dir, args.username, state.get('profile') or {})
     by_code = {record.get("shortcode"): record for record in state.get("archive_records", state.get("post_records", []))}
     if (output_dir / '.posts.sqlite').exists():
         with PostStore(output_dir / '.posts.sqlite', args.username) as store:
@@ -2241,7 +2397,7 @@ def run_posts_offline(args, output_dir):
     if state:
         generate_html(state.get("profile") or {"username": args.username}, records, state.get("avatar_src") or "",
                       build_mode_label(args), output_dir, args.batch_size,
-                      report_names=[kind for kind in REPORTS if getattr(args, kind, False)])
+                      report_names=enabled_report_names(args))
         target = output_dir / "index.html"
     elif reports:
         target = output_dir / reports[0][1]
@@ -2252,7 +2408,8 @@ def run_posts_offline(args, output_dir):
         bool(paths := (record.get('media_paths') or [record.get('local_media_path')]))
         and all(isinstance(path, str) and (output_dir / path).is_file() and (output_dir / path).stat().st_size > 0 for path in paths)
         for record in records)
-    return 0 if (not state or len(records) == len(links) and media_complete) and timeline_satisfies_selection(output_dir, args) else 4
+    reports_complete = args.mode=='full' or all(result==0 for _,_,result in reports)
+    return 0 if reports_complete and (not state or len(records) == len(links) and media_complete) and timeline_satisfies_selection(output_dir, args) else 4
 
 
 
@@ -2280,6 +2437,8 @@ def execute(args: argparse.Namespace) -> int:
         output_dir = ensure_output_dir(args.output_dir, args)
         args.output_dir = str(output_dir)
         with export_lock(output_dir):
+            if args.mode=='highlights':
+                return run_highlights(args)
             if args.mode == "full":
                 return run_full(args)
             if args.mode in ("comments", "likes"):
@@ -3101,6 +3260,8 @@ def run_full(args):
                 args._shared_session = phase._shared_session
             if getattr(phase, "_selected_links", None) is not None:
                 args._selected_links = phase._selected_links
+            if hasattr(phase,'_highlights_result'):
+                args._highlights_result=phase._highlights_result
         phases.append((title, filename, result))
         if mode == "full" and result and getattr(args, "_selected_links", None) is None:
             logger.error("Commenters and likes skipped: the post timeline could not be collected.")
@@ -3130,7 +3291,7 @@ def run_full(args):
         records = [by_code[code] for url in selected_links if (code := parse_shortcode_from_url(url)) in by_code]
         generate_html(state.get("profile") or {"username": args.username}, records, state.get("avatar_src") or "",
                       build_mode_label(args), root, args.batch_size,
-                      report_names=[kind for kind in REPORTS if getattr(args, kind, False)])
+                      report_names=enabled_report_names(args))
     rows = []
     for title, filename, result in phases:
         label = f'<a href="{filename}">{title}</a>' if (root / filename).exists() else title
