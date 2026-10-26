@@ -40,6 +40,24 @@ To use the tested dependency versions, install with
 `python -m pip install -c requirements-tested.txt -e .` inside the environment.
 Avoid installing into a shared Python used by other OSINT tools.
 
+## Updating an existing installation
+
+Run these commands from the project folder, using the same Python environment
+that runs `igdump`:
+
+```console
+git pull
+python -m pip install -e .
+igdump full --help
+```
+
+If you use `.venv`, activate it first as shown above. Repeat the installation
+after updates: `git pull` alone does not update the editable installation's module
+mapping or dependencies. Otherwise new modules may fail to import, for example
+`ModuleNotFoundError: No module named 'igdump_summary'`.
+Existing exports are preserved. Run collection commands from the project folder
+to keep using the same default `exports/` directory.
+
 ## Commands
 
 ### Gallery, text report and Highlights (0.7)
